@@ -1,0 +1,7 @@
+# 构建目录
+build/
+
+# demo 运行输出（统一写到 out/ 目录）
+out/
+*.csv
+demo.png
