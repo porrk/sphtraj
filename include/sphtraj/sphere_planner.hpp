@@ -55,6 +55,10 @@ struct PlannerParams {
   bool pinStartCurvature = true;
   bool pinGoalCurvature = false;
   double goalCurvature = 0.0;  // 1/物理长度
+  double goalLeadLength = -1;  // 终点切向臂 a_g 目标长度（物理）。<0 自动（能量项收敛到 ≈ spanLength/3，
+                               // 末段“近似直线”仅零点几倍 span）；>0 时罚项拉住 a_g，末段直线长度随之增长。
+                               // 有效范围约 [0.3, 3]·spanLength：过小与速度下限罚项冲突，过大牺牲最短性。
+  double wGoalLead = 30.0;     // 切向臂罚项权重（相对偏差平方）
   // ---- 安全裕度（物理长度）----
   double optMargin = 0.0;            // 优化时额外膨胀
   double checkMargin = 0.0;          // 校验时额外膨胀（应小于 optMargin）
@@ -149,6 +153,14 @@ class SphereTrajPlanner {
   void setObstacles(const std::vector<Obstacle>& obs) { obs_ = obs; }
   void addObstacle(const Obstacle& o) { obs_.push_back(o); }
   const std::vector<Obstacle>& obstacles() const { return obs_; }
+  // 速度相关机动能力：更新最大测地曲率（如转弯半径随速度衰减线性减小的模型，逐周期调用）。
+  // 同步刷新由 1/kappaMax 派生的冻结距离与前端引导段长。转弯半径单调减小时限幅单调放宽，
+  // 按当前（最严格）限幅规划的剩余路径在未来限幅下依然可行。
+  void setKappaMax(double kappaMax) {
+    prm_.kappaMax = std::max(kappaMax, 1e-12);
+    prm_.freezeDistance = 1.0 / prm_.kappaMax;
+    prm_.leadLength = 1.0 / prm_.kappaMax;
+  }
   void setGoal(const SurfaceState& g) {
     goal_ = normalizeState(g);
     hasGoal_ = true;
@@ -425,6 +437,7 @@ class SphereTrajPlanner {
     std::vector<CapOpt> caps;
     double LrefU = 1, kapLimU = 1, obsScaleU = 1, proxScaleU = 1, sMinU = 0;
     double wE = 1, wB = 0, wK = 0, wO = 0, wR = 0, wP = 0;
+    double agTargetU = -1, wLead = 0;  // 终点切向臂目标（单位球）与罚项权重；wLead=0 不加
     std::vector<Vec3> anchors;  // 为空则不加近端项
   };
   struct SolveOut {
@@ -638,6 +651,13 @@ class SphereTrajPlanner {
       }
     }
     chainGrad(pb.bd, x, gP, g);
+    // 终点切向臂罚项：J += wLead·((a_g − a_g*)/a_g*)²，a_g = e^{x[1]}（P_{M+1} = pg − a_g·hg 的臂长）
+    if (pb.wLead > 0 && pb.agTargetU > 0) {
+      const double ag = std::exp(x[1]);
+      const double rel = (ag - pb.agTargetU) / pb.agTargetU;
+      J += pb.wLead * rel * rel;
+      g[1] += 2.0 * pb.wLead * rel * ag / pb.agTargetU;
+    }
     return J;
   }
 
@@ -713,6 +733,8 @@ class SphereTrajPlanner {
     pb.obsScaleU = prm_.obsScale / R;
     pb.proxScaleU = prm_.spanLength / R;
     pb.sMinU = prm_.minSpeedFrac * pb.LrefU / M;
+    pb.agTargetU = prm_.goalLeadLength >= 0 ? prm_.goalLeadLength / R : -1;
+    pb.wLead = pb.agTargetU > 0 ? prm_.wGoalLead : 0;
     pb.wE = prm_.wEnergy;
     pb.wB = prm_.wBend;
     pb.wK = prm_.wCurv;

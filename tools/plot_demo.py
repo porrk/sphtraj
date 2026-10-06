@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-R = 1000.0  # 与 demo 中一致
+R = 6371000.0  # 与 demo 中一致（地球平均半径）
 
 
 def read(path):
@@ -38,32 +38,48 @@ def main():
         b = cap_boundary(float(o["lat"]), float(o["lon"]), float(o["radius_m"]))
         dyn = o["dynamic"] == "1"
         ax.fill([p[0] for p in b], [p[1] for p in b], color="tab:red" if dyn else "0.6", alpha=0.45)
-    styles = [("plan_initial.csv", "tab:blue", "initial plan"),
-              ("plan_before_dynamic.csv", "tab:orange", "plan before new obstacle"),
-              ("vehicle_track.csv", "k", "driven track")]
-    for fn, col, lab in styles:
+    # 黑色实飞轨迹先画，绿色“突现后规划”最后画：两者事后几乎重合（跟踪误差 km 级），
+    # 若绿色在下方会被黑色完全遮住
+    styles = [("plan_initial.csv", "tab:blue", "-", 1.6, "initial plan"),
+              ("plan_before_dynamic.csv", "tab:orange", "--", 1.6, "plan before new obstacle"),
+              ("vehicle_track.csv", "k", "-", 1.0, "driven track"),
+              ("plan_after_dynamic.csv", "tab:green", "-.", 1.3, "plan after new obstacle")]
+    for fn, col, ls, lw, lab in styles:
         p = os.path.join(d, fn)
         if not os.path.exists(p):
             continue
         rows = read(p)
-        ax.plot([float(r["lon"]) for r in rows], [float(r["lat"]) for r in rows], color=col, lw=1.6 if col != "k" else 1.0,
-                ls="--" if col == "tab:orange" else "-", label=lab)
+        ax.plot([float(r["lon"]) for r in rows], [float(r["lat"]) for r in rows], color=col, lw=lw, ls=ls, label=lab)
     ax.set_aspect("equal")
+    ax.set_ylim(-10, 60)
     ax.set_xlabel("lon [deg]")
     ax.set_ylabel("lat [deg]")
     ax.legend(loc="lower right")
-    ax.set_title("Sphere R=1000 m, geodesic-disk obstacles")
+    ax.set_title("Earth R=6371 km, no-fly zones (geodesic disks)")
 
     rows = read(os.path.join(d, "plan_initial.csv"))
-    ax2.plot([float(r["s"]) for r in rows], [float(r["kappa"]) for r in rows], label="initial plan kappa_g")
+    ax2.plot([float(r["s"]) / 1000.0 for r in rows], [float(r["kappa"]) * 1000.0 for r in rows],
+             label="initial plan kappa_g")
     tr = read(os.path.join(d, "vehicle_track.csv"))
+    # 累计飞行距离（t 轴 -> 航程轴），用于画随时间变化的转弯半径模型
+    dist, xs, kc, kl = 0.0, [], [], []
+    for i, r in enumerate(tr):
+        if i > 0:
+            dist += float(r["v"]) * (float(r["t"]) - float(tr[i - 1]["t"]))
+        xs.append(dist / 1000.0)
+        kc.append(float(r["kappa_cmd"]) * 1000.0)
+        kl.append(float(r["kappa_lim"]) * 1000.0)
+    klim0 = kl[0] if kl else 0.0
+    ax2.axhline(klim0, color="r", ls=":", lw=1)
+    ax2.axhline(-klim0, color="r", ls=":", lw=1, label="kappa_lim at entry")
+    ax2.plot(xs, kl, color="r", ls="--", lw=1.0, label="kappa_lim(t) (linear turn radius)")
+    ax2.plot(xs, [-x for x in kl], color="r", ls="--", lw=1.0)
+    ax2.plot(xs, kc, color="k", lw=0.7, alpha=0.8, label="flown kappa_cmd")
     ax2b = ax2.twinx()
-    ax2b.plot([float(r["t"]) * 5.0 for r in tr], [float(r["solve_ms"]) for r in tr], color="0.7", lw=0.6,
+    ax2b.plot(xs, [float(r["solve_ms"]) for r in tr], color="0.7", lw=0.6,
               label="replan time [ms]")
-    ax2.axhline(1 / 40, color="r", ls=":", lw=1)
-    ax2.axhline(-1 / 40, color="r", ls=":", lw=1)
-    ax2.set_xlabel("arc length s [m]")
-    ax2.set_ylabel("geodesic curvature [1/m]")
+    ax2.set_xlabel("arc length (plan s / flown distance) [km]")
+    ax2.set_ylabel("geodesic curvature [1/km]")
     ax2b.set_ylabel("replan time [ms]")
     ax2.legend(loc="upper left")
     ax2b.legend(loc="upper right")
