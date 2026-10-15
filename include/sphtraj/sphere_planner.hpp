@@ -127,13 +127,16 @@ inline const char* toString(PlanStatus s) {
 
 struct PlanStats {
   PlanStatus status = PlanStatus::Failed;
+  // valid / length / minClearance / maxKappa / spans 描述规划器里保留的那条曲线。
+  // 新候选被拒绝时，这些字段仍属于继续跟踪的旧曲线；冻结时 valid 来自剩余段的校验。
+  // iters / evals / cost / homotopyDiff 描述本周期尝试的那次求解。
   bool valid = false;
   double solveMs = 0.0;
   int iters = 0, evals = 0;
   double cost = 0.0;
-  double length = 0.0;          // 物理
-  double minClearance = 0.0;    // 物理（相对 radius+checkMargin）
-  double maxKappa = 0.0;        // 物理
+  double length = 0.0;          // 保留曲线的物理总长；没有保留曲线时为 0
+  double minClearance = 0.0;    // 保留曲线受检段相对 radius+checkMargin 的间隔（物理）
+  double maxKappa = 0.0;        // 保留曲线受检段的最大物理曲率
   double homotopyDiff = 0.0;    // 新旧签名最大差（rad）
   int spans = 0;
   bool stitched = false;
@@ -148,18 +151,23 @@ class SphereTrajPlanner {
     double minCnorm = std::numeric_limits<double>::infinity();
   };
 
-  explicit SphereTrajPlanner(const PlannerParams& prm) : prm_(prm) { prm_.finalize(); }
+  explicit SphereTrajPlanner(const PlannerParams& prm) : prm_(prm) {
+    // 必须在 finalize 把负数哨兵写成具体长度之前记下，之后 setKappaMax 才知道哪些是自动值。
+    freezeAuto_ = prm_.freezeDistance < 0.0;
+    leadAuto_ = prm_.leadLength < 0.0;
+    prm_.finalize();
+  }
 
   void setObstacles(const std::vector<Obstacle>& obs) { obs_ = obs; }
   void addObstacle(const Obstacle& o) { obs_.push_back(o); }
   const std::vector<Obstacle>& obstacles() const { return obs_; }
-  // 速度相关机动能力：更新最大测地曲率（如转弯半径随速度衰减线性减小的模型，逐周期调用）。
-  // 同步刷新由 1/kappaMax 派生的冻结距离与前端引导段长。转弯半径单调减小时限幅单调放宽，
-  // 按当前（最严格）限幅规划的剩余路径在未来限幅下依然可行。
+  // 速度相关机动能力：更新最大测地曲率（如转弯半径随速度变化，逐周期调用）。
+  // 构造时 freezeDistance / leadLength 仍为自动值（<0）时，才把它们改成 1/kappaMax。
+  // 调用方给过的正值保持不变。曲率上限变紧后，按旧上限规划的曲线可能不再满足校验。
   void setKappaMax(double kappaMax) {
     prm_.kappaMax = std::max(kappaMax, 1e-12);
-    prm_.freezeDistance = 1.0 / prm_.kappaMax;
-    prm_.leadLength = 1.0 / prm_.kappaMax;
+    if (freezeAuto_) prm_.freezeDistance = 1.0 / prm_.kappaMax;
+    if (leadAuto_) prm_.leadLength = 1.0 / prm_.kappaMax;
   }
   void setGoal(const SurfaceState& g) {
     goal_ = normalizeState(g);
@@ -169,6 +177,7 @@ class SphereTrajPlanner {
     pole_ = z.normalized();
     hasPole_ = true;
   }
+  // 有一条曾通过校验并被采纳的曲线。从零规划失败不会留下落选的初值。
   bool hasPlan() const { return curve_.valid(); }
   const SphereSpline& curve() const { return curve_; }
   const PlannerParams& params() const { return prm_; }
@@ -201,11 +210,24 @@ class SphereTrajPlanner {
       v = validate(so.sp, 0.0);
     }
     if (!hasPole_) setDefaultPole(start.p, goal_.p);
-    if (v.ok || !curve_.valid()) {
+    if (v.ok) {
       curve_ = so.sp;
       lastU_ = 0.0;
+      fillStats(st, so, v, M);
+    } else {
+      // 落选的曲线不写入 curve_。已有旧曲线时，几何量改记旧曲线，valid 仍表示本次没有采纳新解。
+      st.iters = so.res.iters;
+      st.evals = so.res.evals;
+      st.cost = so.res.f;
+      st.valid = false;
+      if (curve_.valid()) {
+        const Validation vKeep = validate(curve_, 0.0);
+        st.length = curve_.length();
+        st.minClearance = vKeep.minClearance;
+        st.maxKappa = vKeep.maxKappa;
+        st.spans = curve_.numSpans();
+      }
     }
-    fillStats(st, so, v, M);
     st.status = v.ok ? PlanStatus::Ok : PlanStatus::Failed;
     st.solveMs = msSince(t0);
     return st;
@@ -224,10 +246,9 @@ class SphereTrajPlanner {
     lastU_ = uV;
     const double sV = old.sOfU(uV), L = old.length();
     if (L - sV < prm_.freezeDistance) {
+      const Validation vFrozen = validate(old, uV);
       st.status = PlanStatus::Frozen;
-      st.valid = true;
-      st.length = L;
-      st.spans = old.numSpans();
+      describeRetained(st, old, vFrozen);
       st.solveMs = msSince(t0);
       return st;
     }
@@ -274,12 +295,16 @@ class SphereTrajPlanner {
       st.status = sameClass ? PlanStatus::Ok : PlanStatus::ClassChangedForced;
     } else if (vNew.ok) {
       st.status = PlanStatus::KeptPreviousHomotopyGuard;
+      describeRetained(st, old, vOld);
     } else if (vOld.ok) {
       st.status = PlanStatus::KeptPreviousInfeasible;
+      describeRetained(st, old, vOld);
     } else {
       const PlanStats fs = planFromScratch(start);
+      const bool accepted = fs.valid;
       st = fs;
-      st.status = fs.valid ? PlanStatus::FrontEndReplan : PlanStatus::Failed;
+      st.status = accepted ? PlanStatus::FrontEndReplan : PlanStatus::Failed;
+      if (!accepted) describeRetained(st, curve_, curve_.valid() ? validate(curve_, u0) : Validation{});
     }
     st.solveMs = msSince(t0);
     return st;
@@ -309,6 +334,7 @@ class SphereTrajPlanner {
 
   // ---------------- 跟踪参考量（最近点 / 横向误差 / 前视点 / 纯追踪曲率） ----------------
   TrackingRef trackingReference(const SurfaceState& meas, double lookahead) {
+    if (!curve_.valid()) return {};
     TrackingRef r = computeTrackingRef(curve_, meas.p.normalized(), meas.h, lastU_, lookahead);
     lastU_ = r.u;
     return r;
@@ -317,9 +343,18 @@ class SphereTrajPlanner {
   // ---------------- 校验：碰撞（障碍半径 + checkMargin）、曲率、退化 ----------------
   Validation validate(const SphereSpline& sp, double u0) const {
     Validation v;
+    if (!sp.valid()) {
+      v.ok = false;
+      v.minClearance = -std::numeric_limits<double>::infinity();
+      v.minCnorm = 0.0;
+      return v;
+    }
     const double R = prm_.R, stepU = prm_.checkStep / R;
     const int M = sp.numSpans();
-    for (int k = std::clamp(static_cast<int>(std::floor(u0)), 0, M - 1); k < M; ++k) {
+    int k0 = static_cast<int>(std::floor(u0));
+    if (k0 < 0) k0 = 0;
+    if (k0 >= M) k0 = M - 1;
+    for (int k = k0; k < M; ++k) {
       const int n = std::max(2, static_cast<int>(std::ceil(sp.spanLengthU(k) / stepU)));
       for (int i = 0; i <= n; ++i) {
         const double u = k + double(i) / n;
@@ -908,17 +943,24 @@ class SphereTrajPlanner {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   }
   void fillStats(PlanStats& st, const SolveOut& so, const Validation& v, int M) const {
-    st.valid = v.ok;
     st.iters = so.res.iters;
     st.evals = so.res.evals;
     st.cost = so.res.f;
-    st.length = so.sp.length();
-    st.minClearance = v.minClearance;
-    st.maxKappa = v.maxKappa;
+    describeRetained(st, so.sp, v);
     st.spans = M;
+  }
+  // 几何字段改记实际保留的曲线。求解次数和代价留给本周期的候选解。
+  static void describeRetained(PlanStats& st, const SphereSpline& sp, const Validation& v) {
+    st.valid = sp.valid() && v.ok;
+    st.length = sp.valid() ? sp.length() : 0.0;
+    st.minClearance = sp.valid() ? v.minClearance : 0.0;
+    st.maxKappa = sp.valid() ? v.maxKappa : 0.0;
+    st.spans = sp.valid() ? sp.numSpans() : 0;
   }
 
   PlannerParams prm_;
+  bool freezeAuto_ = true;
+  bool leadAuto_ = true;
   std::vector<Obstacle> obs_;
   SurfaceState goal_;
   bool hasGoal_ = false;

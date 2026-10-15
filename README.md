@@ -44,7 +44,7 @@ SphereTrajPlanner planner(prm);
 planner.setObstacles(obstacles);                  // {中心单位向量, 物理测地半径}
 planner.setGoal({pg, hg, 0.0});                   // 终点位置/航向/曲率
 planner.planFromScratch({p0, h0, kappa0});        // 初始化（前端 + 优化）
-planner.setKappaMax(1.0 / rMin);                  // 可选：速度相关机动能力，逐周期更新（转弯半径线性减小等模型）
+planner.setKappaMax(1.0 / rMin);                  // 可选。freezeDistance / leadLength 仅构造时为自动值（<0）才随 1/kappaMax 更新
 
 // 每个控制周期：
 PlanStats st = planner.replan(state, v * latency);       // state = {p, h, 当前曲率}
@@ -91,7 +91,7 @@ auto g = c.geom(c.uOfS(s));                // 弧长 s 处的位置 g.pos / 切�
 | 每周期重规划 | 均值 0.30 ms，p99 0.86 ms，平均 22 次 L-BFGS 迭代 |
 | 相邻周期规划偏差（前 1000 km） | p50 1.2 km，p99 7.4 km；突现禁飞区当周期绕行偏差 103.6 km（旧方案穿入 130 km，新方案间隔 58.4 km） |
 | 横向误差最大值 | 6.7 km |
-| 到达终点（t = 1860 s，末速 3.3 km/s，r_min 791 km） | 位置误差 1.3 km；航向误差 21°（70° 进场航向 + 1°/步噪声 + 125 km 前视下末段航向收敛慢，属跟踪律/场景应力结果，缩短前视或放宽进场航向可显著减小） |
+| 到达终点（t = 1860 s，末速 3.3 km/s，r_min 791 km；剩余弧长 < 3 km 即停止） | 位置误差 1.3 km；相对 70° 进场航向 1.1° |
 | 飞行轨迹对禁飞区边界最小间隔 | 57.5 km |
 | 曲率指令对时变限幅 | 全程 \|κ_cmd\| ≤ κlim(t)，无违例；限幅被 100% 用满过（1°/步噪声下跟踪需要全部机动能力） |
 

@@ -183,6 +183,84 @@ static void testBlockedReplan() {
         "阻塞后重规划：status=%s, 新路径有效 (clr %.1f m)", toString(st.status), v.minClearance);
 }
 
+static void testRetainedStatsAndEmptyCurve() {
+  PlannerParams prm;
+  prm.R = 1000.0;
+  prm.kappaMax = 1.0 / 40.0;
+  prm.spanLength = 50.0;
+  prm.optMargin = 10.0;
+  prm.checkMargin = 4.0;
+  prm.freezeDistance = 30.0;
+  prm.leadLength = 80.0;
+  SphereTrajPlanner plExplicit(prm);
+  plExplicit.setKappaMax(1.0 / 20.0);
+  CHECK(std::fabs(plExplicit.params().freezeDistance - 30.0) < 1e-9, "显式冻结距离不被 setKappaMax 覆盖");
+  CHECK(std::fabs(plExplicit.params().leadLength - 80.0) < 1e-9, "显式引导段不被 setKappaMax 覆盖");
+  CHECK(std::fabs(plExplicit.params().kappaMax - 1.0 / 20.0) < 1e-12, "setKappaMax 更新曲率上限");
+
+  PlannerParams autoPrm = prm;
+  autoPrm.freezeDistance = -1.0;
+  autoPrm.leadLength = -1.0;
+  autoPrm.kappaMax = 1.0 / 40.0;
+  SphereTrajPlanner plAuto(autoPrm);
+  CHECK(std::fabs(plAuto.params().freezeDistance - 40.0) < 1e-9, "自动冻结距离初值");
+  plAuto.setKappaMax(1.0 / 20.0);
+  CHECK(std::fabs(plAuto.params().freezeDistance - 20.0) < 1e-9, "自动冻结距离随 kappaMax 更新");
+  CHECK(std::fabs(plAuto.params().leadLength - 20.0) < 1e-9, "自动引导段随 kappaMax 更新");
+
+  const Vec3 ps = fromLatLon(0, 0), pg = fromLatLon(25, 30);
+  const SurfaceState s0{ps, headingFromAzimuth(ps, 45), 0.0};
+  PlannerParams keepPrm = prm;
+  keepPrm.freezeDistance = -1.0;
+  keepPrm.leadLength = -1.0;
+  SphereTrajPlanner pl(keepPrm);
+  pl.setGoal({pg, headingFromAzimuth(pg, 60), 0.0});
+  PlanStats st = pl.planFromScratch(s0);
+  CHECK(st.valid && pl.hasPlan(), "保留测试：初始规划有效");
+  const double len0 = pl.curve().length();
+  const int spans0 = pl.curve().numSpans();
+  const Vec3 end0 = pl.curve().pos(pl.curve().uMax());
+  // 新终点放在障碍中心：任何到达它的曲线都穿障。旧曲线远离该点，应被留下。
+  const Vec3 bad = fromLatLon(40, 50);
+  pl.addObstacle({bad, 80.0});
+  pl.setGoal({bad, headingFromAzimuth(bad, 60), 0.0});
+  st = pl.replan(s0, 0.0);
+  CHECK(st.status == PlanStatus::KeptPreviousInfeasible, "新解穿障时保留旧解 status=%s", toString(st.status));
+  CHECK(st.valid, "保留的旧解仍然有效");
+  CHECK(std::fabs(st.length - len0) < 1e-6 && st.spans == spans0, "统计量属于保留曲线");
+  CHECK(st.minClearance >= 0.0, "保留曲线间隔 %.3f m", st.minClearance);
+  CHECK(angleBetween(pl.curve().pos(pl.curve().uMax()), end0) < 1e-9, "曲线终点未被坏目标替换");
+
+  PlannerParams fr = keepPrm;
+  fr.freezeDistance = 1.0e6;
+  SphereTrajPlanner plFr(fr);
+  plFr.setGoal({pg, headingFromAzimuth(pg, 60), 0.0});
+  st = plFr.planFromScratch(s0);
+  CHECK(st.valid, "冻结测试：初始规划有效");
+  const double lenF = plFr.curve().length();
+  plFr.addObstacle({plFr.curve().pos(plFr.curve().uOfS(0.5 * lenF)), 100.0});
+  st = plFr.replan(s0, 0.0);
+  CHECK(st.status == PlanStatus::Frozen, "剩余距离小于冻结距离时冻结 status=%s", toString(st.status));
+  CHECK(!st.valid && st.minClearance < 0.0, "冻结曲线已穿障时不得报有效 (clr %.3f)", st.minClearance);
+  CHECK(plFr.hasPlan() && std::fabs(st.length - lenF) < 1e-6, "冻结后统计长度仍是当前曲线");
+
+  PlannerParams badP = keepPrm;
+  badP.checkMargin = 1.0e9;
+  SphereTrajPlanner plBad(badP);
+  plBad.setObstacles({{fromLatLon(10, 10), 50.0}});
+  plBad.setGoal({pg, headingFromAzimuth(pg, 60), 0.0});
+  st = plBad.planFromScratch(s0);
+  CHECK(!st.valid && !plBad.hasPlan() && st.spans == 0 && st.length == 0.0, "失败的从零规划不留下曲线");
+  const TrackingRef tr = plBad.trackingReference(s0, 10.0);
+  CHECK(tr.u == 0.0 && tr.kappaPurePursuit == 0.0, "无曲线时跟踪返回空参考");
+  SphereSpline empty;
+  const auto g = empty.geom(0.3);
+  CHECK(g.cnorm == 0.0 && empty.uOfS(1.0) == 0.0 && empty.closestU(ps, 0.2) == 0.0, "空样条几何查询返回空值");
+  CHECK(empty.samplePositions(0.0, 0.1).empty(), "空样条采样为空");
+  const auto badVal = plBad.validate(empty, 0.0);
+  CHECK(!badVal.ok, "空曲线校验为无效");
+}
+
 int main() {
   testQuadAndBasis();
   testGeometry();
@@ -190,6 +268,7 @@ int main() {
   testPlannerBoundaryAndGradient();
   testHomotopySignature();
   testBlockedReplan();
+  testRetainedStatsAndEmptyCurve();
   std::printf("\n%s (%d failures)\n", g_fail ? "SOME TESTS FAILED" : "ALL TESTS PASSED", g_fail);
   return g_fail ? 1 : 0;
 }

@@ -1,5 +1,5 @@
 // 闭环演示：高超声速滑翔再入场景（地球尺度）。
-// 从再入界面从零规划 → 每个制导周期（1 Hz）重规划 + 球面纯追踪跟踪 → 中途出现新禁飞区。
+// 从再入界面从零规划 → 每个制导周期（5 s，0.2 Hz）重规划 + 球面纯追踪跟踪 → 中途出现新禁飞区。
 // 速度模型：从再入界面 7.0 km/s 线性衰减到末段 2.0 km/s（历时 2500 s），之后保持。
 // 转弯半径模型（简化）：等侧向过载下 r = v²/(n·g) 随速度平方减小，这里简化为与速度同相位的线性减小，
 // 即 kappaMax(t) = 1/rMin(t) 随时间单调放宽，机动能力随减速增强。
@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
   const std::string outDir = argc > 1 ? argv[1] : ".";
   // ---------------- 场景：地球尺度滑翔再入 ----------------
   // 速度与转弯半径模型（线性）：v 从 7000 → 2000 m/s（2500 s）；转弯半径与速度同相位线性减小
-  // 1200 km → 650 km（等效侧向过载 v²/(r·g)：再入界面 ~4 g，末段 ~2.7 g），即 κmax 从 8.3e-7 → 6.7e-6 1/m。
+  // 1200 km → 650 km（等效侧向过载 v²/(r·g)：再入界面 ~4 g，末段 ~2.7 g），即 κmax 从 8.3e-7 → 1.5e-6 1/m。
   const double vEntry = 7000.0, vTerm = 2000.0, tDecay = 2500.0;
   const double rMinEntry = 1200000.0, rMinTerm = 650000.0;
   auto speedAt = [&](double t) { return vEntry + (vTerm - vEntry) * std::min(t / tDecay, 1.0); };
@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
   PlannerParams prm;
   prm.R = 6371000.0;             // 地球平均半径
   prm.kappaMax = 1.0 / rMinEntry; // 初始转弯半径 1200 km，之后每周期按线性减小模型更新（setKappaMax）
-  prm.spanLength = 300000.0;     // 每个 span 约 300 km（≈ 末段转弯半径的 2 倍，span 角约 2.7°）
+  prm.spanLength = 300000.0;     // 每个 span 约 300 km（约为末段转弯半径 650 km 的一半，span 角约 2.7°）
   prm.optMargin = 60000.0;       // 优化膨胀 60 km
   prm.checkMargin = 25000.0;     // 校验膨胀 25 km（给跟踪误差留余量）
   prm.pinStartCurvature = true;   // 起点曲率 = 飞行器当前曲率（转向指令跨周期连续）
@@ -67,8 +67,9 @@ int main(int argc, char** argv) {
   planner.setObstacles(obs);
   // 再入界面 (15,8) → 末段目标 (27,100)：大圆航程约 10000 km（洲际滑翔的典型量级）
   const Vec3 ps = fromLatLon(15, 8), pg = fromLatLon(27, 100);
+  const Vec3 hGoal = headingFromAzimuth(pg, 70);
   const SurfaceState start{ps, headingFromAzimuth(ps, 60), 0.0};
-  planner.setGoal({pg, headingFromAzimuth(pg, 70), 0.0});
+  planner.setGoal({pg, hGoal, 0.0});
 
   std::printf("great-circle distance start->goal: %.1f km\n", R * angleBetween(ps, pg) / 1000.0);
   std::printf("gradient check (rel err): %.2e\n", planner.gradientCheck(start));
@@ -93,7 +94,7 @@ int main(int argc, char** argv) {
 
   // ---------------- 闭环仿真 ----------------
   // 5 s 制导/重规划周期，前视 125 km，侧向漂移 30 m/s（急流量级），航向噪声 1°/步。
-  // 0.2 s 计算/通信延迟用 advanceDist = v*0.2 补偿。转弯半径每周期按线性减小模型收紧 planner 限幅。
+  // 0.2 s 计算/通信延迟用 advanceDist = v*0.2 补偿。转弯半径减小，每周期经 setKappaMax 放宽曲率上限。
   const double dt = 5.0, lookahead = 125000.0, drift = 30.0;
   std::mt19937 rng(42);
   std::normal_distribution<double> headNoise(0.0, deg2rad(1.0));
@@ -181,9 +182,10 @@ int main(int argc, char** argv) {
                  kCmd, kapNow, rMin, st.solveMs, toString(st.status));
 
     if (ref.remaining < 3000.0) {
-      std::printf("[t=%.1f] goal reached: pos err %.3f km, heading err %.2f deg, final speed %.1f m/s, r_min %.0f km, flown %.1f km\n",
-                  t, R * angleBetween(p, pg) / 1000.0,
-                  rad2deg(angleBetween(h, headingFromAzimuth(pg, 90))), v, rMin / 1000.0, driven / 1000.0);
+      // 此处停止时路径还剩不足 3 km。航向误差相对目标进场航向 70°，不是相对正东。
+      std::printf("[t=%.1f] goal reached: pos err %.3f km, heading err vs 70 deg approach %.2f deg (%.2f km path left), final speed %.1f m/s, r_min %.0f km, flown %.1f km\n",
+                  t, R * angleBetween(p, pg) / 1000.0, rad2deg(angleBetween(h, hGoal)), ref.remaining / 1000.0, v,
+                  rMin / 1000.0, driven / 1000.0);
       break;
     }
     // 飞行器运动 + 扰动

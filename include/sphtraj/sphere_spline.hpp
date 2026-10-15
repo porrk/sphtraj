@@ -35,20 +35,24 @@ class SphereSpline {
     for (int k = 0; k < M; ++k) cum_[k + 1] = cum_[k] + speedIntegral(k, k, k + 1.0);
   }
 
-  bool valid() const { return M_ > 0; }
+  bool valid() const { return M_ > 0 && static_cast<int>(P_.size()) >= M_ + 3; }
   int numSpans() const { return M_; }
   double uMax() const { return double(M_); }
   double radius() const { return R_; }
   const std::vector<Vec3>& ctrl() const { return P_; }
   double lengthU() const { return cum_.empty() ? 0.0 : cum_.back(); }
   double length() const { return R_ * lengthU(); }  // 物理总长
-  double spanLengthU(int k) const { return cum_[k + 1] - cum_[k]; }
+  double spanLengthU(int k) const {
+    if (k < 0 || k >= M_ || static_cast<int>(cum_.size()) < M_ + 1) return 0.0;
+    return cum_[k + 1] - cum_[k];
+  }
 
   Ambient ambient(double u) const {
+    Ambient a;
+    if (!valid()) return a;
     const int k = basis_.spanOf(u);
     double N[3][4];
     basis_.eval(u, k, N);
-    Ambient a;
     for (int j = 0; j < 4; ++j) {
       a.c += P_[k + j] * N[0][j];
       a.c1 += P_[k + j] * N[1][j];
@@ -75,24 +79,38 @@ class SphereSpline {
     g.kappaU = W > 1e-15 ? r * r * r * w.dot(a.c2) / (W * W * W) : 0.0;  // |c|³ (c×c')·c'' / |c×c'|³
     return g;
   }
-  Geom geom(double u) const { return geomFromAmbient(ambient(u)); }
-  Vec3 pos(double u) const { return ambient(u).c.normalized(); }
-  double speedU(double u) const {
+  Geom geom(double u) const {
+    if (!valid()) return {};
     const Ambient a = ambient(u);
-    return a.c.cross(a.c1).norm() / a.c.squaredNorm();
+    if (a.c.squaredNorm() <= 0.0) return {};
+    return geomFromAmbient(a);
+  }
+  Vec3 pos(double u) const {
+    if (!valid()) return {};
+    return ambient(u).c.normalized();
+  }
+  double speedU(double u) const {
+    if (!valid()) return 0.0;
+    const Ambient a = ambient(u);
+    const double r2 = a.c.squaredNorm();
+    if (r2 <= 0.0) return 0.0;
+    return a.c.cross(a.c1).norm() / r2;
   }
 
   // 参数 -> 物理弧长
   double sOfU(double u) const {
+    if (!valid()) return 0.0;
     const int k = basis_.spanOf(u);
     return R_ * (cum_[k] + speedIntegral(k, double(k), u));
   }
 
   // 物理弧长 -> 参数（二分定位 span + Newton）
   double uOfS(double s) const {
+    if (!valid()) return 0.0;
     const double sU = clampd(s / R_, 0.0, lengthU());
     int k = static_cast<int>(std::upper_bound(cum_.begin(), cum_.end(), sU) - cum_.begin()) - 1;
-    k = std::clamp(k, 0, M_ - 1);
+    if (k < 0) k = 0;
+    if (k >= M_) k = M_ - 1;
     const double t = sU - cum_[k], L = spanLengthU(k);
     double u = k + (L > 0 ? t / L : 0.0);
     for (int it = 0; it < 8; ++it) {
@@ -109,6 +127,7 @@ class SphereSpline {
 
   // 最近点投影：在窗口 [uGuess-back, uGuess+fwd] 内最大化 γ(u)·p（粗搜 + 带保护的 Newton）
   double closestU(const Vec3& p, double uGuess, double back = 0.5, double fwd = 2.0) const {
+    if (!valid()) return 0.0;
     const double lo = std::max(0.0, uGuess - back), hi = std::min(uMax(), uGuess + fwd);
     const int n = std::max(2, static_cast<int>(std::ceil((hi - lo) / 0.1)));
     double u = lo, best = -2.0;
@@ -136,14 +155,18 @@ class SphereSpline {
 
   // 在物理弧长区间 [s0, s1] 上等弧长采样 K 个点
   std::vector<Vec3> sampleUniformS(double s0, double s1, int K) const {
-    std::vector<Vec3> out(K);
+    std::vector<Vec3> out;
+    if (!valid() || K < 2) return out;
+    out.resize(K);
     for (int i = 0; i < K; ++i) out[i] = pos(uOfS(s0 + (s1 - s0) * i / double(K - 1)));
     return out;
   }
 
   // 在参数区间 [u0, u1] 上等参数采样 K 个点（热启动用：保留旧解的参数化，拟合几乎无损）
   std::vector<Vec3> sampleUniformU(double u0, double u1, int K) const {
-    std::vector<Vec3> out(K);
+    std::vector<Vec3> out;
+    if (!valid() || K < 2) return out;
+    out.resize(K);
     for (int i = 0; i < K; ++i) out[i] = pos(u0 + (u1 - u0) * i / double(K - 1));
     return out;
   }
@@ -151,9 +174,13 @@ class SphereSpline {
   // 从 u0 到终点，按角步长不超过 maxStepU 采样位置
   std::vector<Vec3> samplePositions(double u0, double maxStepU) const {
     std::vector<Vec3> out;
+    if (!valid()) return out;
     u0 = clampd(u0, 0.0, uMax());
     out.push_back(pos(u0));
-    for (int k = std::clamp(static_cast<int>(std::floor(u0)), 0, M_ - 1); k < M_; ++k) {
+    int k0 = static_cast<int>(std::floor(u0));
+    if (k0 < 0) k0 = 0;
+    if (k0 >= M_) k0 = M_ - 1;
+    for (int k = k0; k < M_; ++k) {
       const int n = std::max(1, static_cast<int>(std::ceil(spanLengthU(k) / maxStepU)));
       for (int i = 1; i <= n; ++i) {
         const double u = k + double(i) / n;
@@ -212,6 +239,7 @@ struct TrackingRef {
 inline TrackingRef computeTrackingRef(const SphereSpline& sp, const Vec3& p, const Vec3& h, double uGuess,
                                       double lookahead) {
   TrackingRef r;
+  if (!sp.valid()) return r;
   const double R = sp.radius();
   r.u = sp.closestU(p, uGuess, 0.5, 2.0);
   const SphereSpline::Geom g = sp.geom(r.u);

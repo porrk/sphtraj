@@ -44,11 +44,18 @@ class ClampedCubicBasis {
   int numSpans() const { return M_; }
   int numCtrl() const { return M_ + 3; }
 
-  // 返回 u 所在 span k（作用于控制点 k..k+3），并把 u 夹持到 [0, M]
+  // 返回 u 所在 span k（作用于控制点 k..k+3），并把 u 夹持到 [0, M]。
+  // M==0 时没有合法 span，返回 0 且不调用上下界颠倒的 clamp。
   int spanOf(double& u) const {
+    if (M_ <= 0) {
+      u = 0.0;
+      return 0;
+    }
     u = std::clamp(u, 0.0, double(M_));
     int k = static_cast<int>(std::floor(u));
-    return std::clamp(k, 0, M_ - 1);
+    if (k < 0) k = 0;
+    if (k >= M_) k = M_ - 1;
+    return k;
   }
 
   // ders[d][j]：第 d 阶导数(d=0,1,2)的基函数值，对应控制点 k+j
