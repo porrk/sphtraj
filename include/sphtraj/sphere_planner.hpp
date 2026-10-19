@@ -7,13 +7,14 @@
 //   P_{M+2} = pg, P_{M+1} = pg - a_g hg         → 终点航向精确
 //   ℓs·P2 = 3 a_s² κ0  (ℓs = ps × hs)           → 起点曲率 = 当前曲率（可选，保证转向指令连续）
 //   ℓg·P_M = 3 a_g² κg (ℓg = pg × hg)           → 终点曲率（可选）
-// 代价：J = wE·E + wB·B + wK·K + wO·O + wR·Rad + wP·Prox
+// 代价：J = wE·E + wB·B + wK·K + wO·O + wR·Rad + wP·Prox + wL·Leg
 //   E   = M ∫|γ'|² du / Lref²         （≥ (L/Lref)²，等号当且仅当匀速 → 最短且近似弧长参数化）
 //   B   = ∫ κ² ds / (κlim² Lref)      （弯曲能量正则）
 //   K   = (1/M) ∫ [max(0, |κ|/κlim - 1)³ + max(0, 1 - |γ'|/smin)³] du   （曲率上限 + 速度下限防尖点）
 //   O   = (1/M) ∫ Σ_i max(0, (γ·n_i - cos r_i)/(sin r_i σ))³ du
 //   Rad = Σ (|P_j|² - 1)²             （消除径向冗余自由度）
 //   Prox= Σ |P_j - P_j^warm|² / Δ²    （近端项：相邻周期一致性）
+//   Leg = Σ_j ω_j (ℓg·P_j)² / Δ²      （末段对齐：尾部控制点拉到终端大圆平面，见 goalLegLength）
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -55,10 +56,17 @@ struct PlannerParams {
   bool pinStartCurvature = true;
   bool pinGoalCurvature = false;
   double goalCurvature = 0.0;  // 1/物理长度
-  double goalLeadLength = -1;  // 终点切向臂 a_g 目标长度（物理）。<0 自动（能量项收敛到 ≈ spanLength/3，
-                               // 末段“近似直线”仅零点几倍 span）；>0 时罚项拉住 a_g，末段直线长度随之增长。
-                               // 有效范围约 [0.3, 3]·spanLength：过小与速度下限罚项冲突，过大牺牲最短性。
+  double goalLeadLength = -1;  // 终点切向臂 a_g 目标长度（物理）。<0 自动（能量项收敛到 ≈ spanLength/3）。
+                               // 已由 goalLegLength 覆盖，保留仅为兼容旧绑定/旧配置；新调用方不要设。
   double wGoalLead = 30.0;     // 切向臂罚项权重（相对偏差平方）
+  double goalLegLength = -1;   // 末段“沿到达航向大圆”的对齐航线目标长度（物理）。<=0 关闭。
+                               // 一个 span 的 4 个控制点若都落在终端大圆平面（ℓg·P = 0）上，
+                               // 该 span 就精确落在该大圆上；本项按到终点的距离给尾部控制点
+                               // 加权拉向该平面，使飞行器尽早对齐到达航向。每多拉入一个控制点
+                               // 就多出约一个 span 的对齐段，因而可以设得远大于 spanLength。
+                               // 软罚项：与禁飞区/曲率上限冲突时自动缩短；窗口还按剩余航程的
+                               // kLegReachFrac 封顶，过大目标不会把解拉坏。
+  double wGoalLeg = 20.0;      // 末段对齐罚项权重（偏差按 spanLength 归一化后平方）
   // ---- 安全裕度（物理长度）----
   double optMargin = 0.0;            // 优化时额外膨胀
   double checkMargin = 0.0;          // 校验时额外膨胀（应小于 optMargin）
@@ -144,6 +152,9 @@ struct PlanStats {
 
 class SphereTrajPlanner {
  public:
+  // 末段对齐窗口相对（剩余）航程的上限，见 makeProblem
+  static constexpr double kLegReachFrac = 0.4;
+
   struct Validation {
     bool ok = true;
     double minClearance = std::numeric_limits<double>::infinity();
@@ -473,6 +484,9 @@ class SphereTrajPlanner {
     double LrefU = 1, kapLimU = 1, obsScaleU = 1, proxScaleU = 1, sMinU = 0;
     double wE = 1, wB = 0, wK = 0, wO = 0, wR = 0, wP = 0;
     double agTargetU = -1, wLead = 0;  // 终点切向臂目标（单位球）与罚项权重；wLead=0 不加
+    Vec3 legN;                  // 终端大圆平面法向 ℓg = pg × hg
+    double legScaleU = 1, wLeg = 0;    // 末段对齐偏差归一化尺度与权重；wLeg=0 不加
+    std::vector<double> legW;   // 每个控制点的对齐权重 ω_j（为空则不加）
     std::vector<Vec3> anchors;  // 为空则不加近端项
   };
   struct SolveOut {
@@ -627,6 +641,17 @@ class SphereTrajPlanner {
       J += pb.wR * e * e;
       gP[j] += P[j] * (4.0 * pb.wR * e);
     }
+    // 末段对齐项：把尾部控制点拉到终端大圆平面 ℓg·P = 0 上
+    if (!pb.legW.empty() && pb.wLeg > 0) {
+      const double s = pb.wLeg / (pb.legScaleU * pb.legScaleU);
+      for (int j = 2; j <= M; ++j) {
+        if (pb.legW[j] <= 0.0) continue;
+        const double e = P[j].dot(pb.legN);
+        const double sw = s * pb.legW[j];
+        J += sw * e * e;
+        gP[j] += pb.legN * (2.0 * sw * e);
+      }
+    }
     // 近端项
     if (!pb.anchors.empty() && pb.wP > 0) {
       const double s = pb.wP / (pb.proxScaleU * pb.proxScaleU);
@@ -770,6 +795,29 @@ class SphereTrajPlanner {
     pb.sMinU = prm_.minSpeedFrac * pb.LrefU / M;
     pb.agTargetU = prm_.goalLeadLength >= 0 ? prm_.goalLeadLength / R : -1;
     pb.wLead = pb.agTargetU > 0 ? prm_.wGoalLead : 0;
+    // 末段对齐窗口：控制点 P_j 的 Greville 横坐标为 ξ_j = j-1（2 ≤ j ≤ M），按它到终点的
+    // 参数距离折算成物理长度后渐入。窗口比目标腿长多一个 span —— span k 要精确落在大圆上
+    // 需要 P_k..P_{k+3} 全在平面内，其中最靠前的控制点比该段起点还要再往前约一个 span。
+    // 权重用 (1-x²)² 平滑收敛到 0，避免窗口边缘的控制点在相邻周期间跳进跳出。
+    pb.legN = b.lg;
+    pb.legScaleU = prm_.spanLength / R;
+    if (prm_.goalLegLength > 0.0) {
+      const double spanPhys = pb.LrefU * R / M;   // 本次规划的平均 span 物理长度
+      // 窗口再按航程封顶：窗口吃掉整条航路时，「最短」已无自由度可言，解会被拉坏
+      // （实测 9450 km 航路上窗口超过约一半就开始侵蚀曲率裕度，0.9 倍直接校验失败）。
+      // 封顶同时让窗口随剩余航程自动收缩，末段不会出现整条剩余路径被拉上大圆的突变。
+      const double reach = std::min(prm_.goalLegLength + spanPhys, kLegReachFrac * pb.LrefU * R);
+      // pinG 时 P_M 已被终点曲率条件钉死（ℓg·P_M = 3a_g²κg），不参与，免得两项互相拉扯
+      const int jLast = b.pinG ? M - 1 : M;
+      pb.legW.assign(M + 3, 0.0);
+      for (int j = 2; j <= jLast; ++j) {
+        const double x = (M - (j - 1)) * spanPhys / reach;
+        if (x >= 1.0) continue;
+        const double t = 1.0 - x * x;
+        pb.legW[j] = t * t;
+      }
+      pb.wLeg = prm_.wGoalLeg;
+    }
     pb.wE = prm_.wEnergy;
     pb.wB = prm_.wBend;
     pb.wK = prm_.wCurv;

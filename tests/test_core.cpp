@@ -135,6 +135,92 @@ static void testPlannerBoundaryAndGradient() {
   CHECK(angleBetween(g0.pos, ps) < 1e-14 && angleBetween(g1.pos, pg) < 1e-14, "起终点位置精确");
 }
 
+// 末段对齐项（goalLegLength）：地球尺度再入场景下的腿长增长、安全让步与梯度正确性。
+// 「对齐腿长」= 从终点往回、|ℓg·γ| 保持在 tol 以内的连续物理弧长（ℓg = pg × hg 为终端大圆法向）。
+static double alignedLeg(const SphereSpline& c, const Vec3& lg, double R, double tol) {
+  const double L = c.length();
+  double s = L;
+  for (; s > 0.0; s -= 2000.0)
+    if (R * std::fabs(c.pos(c.uOfS(s)).dot(lg)) > tol) break;
+  return L - s;
+}
+
+static void testGoalLegAlignment() {
+  const double R = 6371000.0;
+  const Vec3 ps = fromLatLon(15, 8), pg = fromLatLon(27, 100);
+  const Vec3 hg = headingFromAzimuth(pg, 70.0);
+  const Vec3 lg = pg.cross(hg).normalized();
+  const SurfaceState s0{ps, headingFromAzimuth(ps, 60.0), 0.0};
+  auto cap = [&](double lat, double lon, double rd) { return Obstacle{fromLatLon(lat, lon), deg2rad(rd) * R}; };
+  const std::vector<Obstacle> obs = {cap(27, 37, 3.1), cap(30, 58, 3.5), cap(21, 76, 3.2), cap(18, 52, 3.0)};
+
+  auto make = [&](double legLen) {
+    PlannerParams p;
+    p.R = R;
+    p.kappaMax = 1.0 / 1.0e6;
+    p.spanLength = 600e3;
+    p.optMargin = 80e3;
+    p.checkMargin = 25e3;
+    p.pinStartCurvature = true;
+    p.pinGoalCurvature = true;
+    p.goalCurvature = 0.0;
+    p.goalLegLength = legLen;
+    return p;
+  };
+  struct Run { bool valid; double len, leg, clr, kapRatio; };
+  auto run = [&](double legLen) {
+    const PlannerParams p = make(legLen);
+    SphereTrajPlanner pl(p);
+    pl.setObstacles(obs);
+    pl.setGoal({pg, hg, 0.0});
+    const PlanStats st = pl.planFromScratch(s0);
+    Run r{st.valid, st.length, 0.0, st.minClearance, st.maxKappa / p.kappaMax};
+    if (st.valid) r.leg = alignedLeg(pl.curve(), lg, R, 5e3);
+    return r;
+  };
+
+  // 关闭时必须与历史行为一致（goalLegLength <= 0 不加项）
+  const Run off = run(-1.0);
+  CHECK(off.valid, "末段对齐：关闭时规划有效 (len %.0f km, leg %.0f km)", off.len / 1e3, off.leg / 1e3);
+
+  const Run on = run(2400e3);
+  CHECK(on.valid, "末段对齐：开启时规划仍有效 (len %.0f km)", on.len / 1e3);
+  CHECK(on.leg > 2.0 * off.leg, "末段对齐：腿长显著增长 %.0f km -> %.0f km", off.leg / 1e3, on.leg / 1e3);
+  CHECK(on.len < 1.06 * off.len, "末段对齐：总航程增幅有界 %.0f km -> %.0f km (+%.1f%%)", off.len / 1e3,
+        on.len / 1e3, 100.0 * (on.len / off.len - 1.0));
+  CHECK(on.clr > 0.0, "末段对齐：禁飞区间隔仍为正 (%.1f km)", on.clr / 1e3);
+  CHECK(on.kapRatio <= 1.0, "末段对齐：曲率未超限 (%.2f x kappaMax)", on.kapRatio);
+
+  // 腿长单调性（到饱和为止）：要得越多，拿到的不应更少
+  const Run mid = run(1200e3);
+  CHECK(mid.valid && mid.leg > off.leg && on.leg > mid.leg, "末段对齐：腿长随目标单调 %.0f < %.0f < %.0f km",
+        off.leg / 1e3, mid.leg / 1e3, on.leg / 1e3);
+
+  // 过分的要求必须软化降级，而不是把解做坏（对比 goalLeadLength 在 1200km 处直接失效）
+  const Run huge = run(8000e3);
+  CHECK(huge.valid, "末段对齐：过大目标仍得到可行解（软罚项降级）");
+  CHECK(huge.clr > 0.0 && huge.kapRatio <= 1.05, "末段对齐：过大目标下安全量不破 (clr %.1f km, kap %.2f)",
+        huge.clr / 1e3, huge.kapRatio);
+
+  // 新代价项的解析梯度
+  PlannerParams gp = make(2400e3);
+  gp.goalCurvature = -1.0e-7;  // 让 pinG 的终点曲率分支也带上非零项
+  SphereTrajPlanner plg(gp);
+  plg.setObstacles(obs);
+  plg.setGoal({pg, hg, 0.0});
+  const double gerr = plg.gradientCheck(s0, 11);
+  CHECK(gerr >= 0 && gerr < 1e-5, "末段对齐：解析梯度 vs 中心差分 (rel %.1e)", gerr);
+
+  // pinGoalCurvature=false 时 P_M 也应参与拉平
+  PlannerParams np = make(2400e3);
+  np.pinGoalCurvature = false;
+  SphereTrajPlanner pln(np);
+  pln.setObstacles(obs);
+  pln.setGoal({pg, hg, 0.0});
+  const PlanStats ns = pln.planFromScratch(s0);
+  CHECK(ns.valid && alignedLeg(pln.curve(), lg, R, 5e3) > off.leg, "末段对齐：pinGoalCurvature=false 亦生效");
+}
+
 static std::vector<Vec3> densify(const std::vector<Vec3>& pts, int n) {
   std::vector<Vec3> out;
   for (size_t i = 1; i < pts.size(); ++i)
@@ -266,6 +352,7 @@ int main() {
   testGeometry();
   testPurePursuit();
   testPlannerBoundaryAndGradient();
+  testGoalLegAlignment();
   testHomotopySignature();
   testBlockedReplan();
   testRetainedStatsAndEmptyCurve();

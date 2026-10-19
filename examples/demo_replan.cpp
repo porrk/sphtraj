@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
   prm.checkMargin = 25000.0;     // 校验膨胀 25 km（给跟踪误差留余量）
   prm.pinStartCurvature = true;   // 起点曲率 = 飞行器当前曲率（转向指令跨周期连续）
   prm.pinGoalCurvature = true;    // 以零曲率（直线）进入末段交接
-  prm.goalLeadLength = 0.6 * prm.spanLength;  // 末段切向臂约 spanLength/2，末段“近似直线”长度随之增长
+  prm.goalLegLength = 1200e3;     // 末段沿到达航向大圆对齐（软罚项，窗口按剩余航程封顶）
   prm.goalCurvature = 0.0;
   SphereTrajPlanner planner(prm);
 
