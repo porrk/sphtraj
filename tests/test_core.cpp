@@ -104,6 +104,48 @@ static void testPurePursuit() {
   CHECK(std::fabs(k2 - kap) < 1e-12, "球面纯追踪曲率公式 (%.6f vs %.6f)", k2, kap);
 }
 
+static void testTrackingRefModes() {
+  const SphereSpline sp = randomSpline(6, 3);
+  const double R = sp.radius(), L = sp.length();
+  const auto gEnd = sp.geom(sp.uMax());
+  // 车辆取曲线上的点且航向与切向一致，最近点/弧长可精确对照
+  const double u0 = 2.0;
+  const Vec3 p = sp.pos(u0), h = sp.geom(u0).tangent;
+
+  // 固定前视 (默认参数)：超出终点时沿终点切向大圆外延
+  const TrackingRef rFix = computeTrackingRef(sp, p, h, u0, L);
+  CHECK(std::fabs(rFix.lookaheadS - (rFix.s + L)) < 1e-12 && rFix.lookaheadS > L,
+        "固定前视弧长外推 (s=%.3f, sLd=%.3f)", rFix.s, rFix.lookaheadS);
+  CHECK(std::fabs(R * angleBetween(rFix.lookaheadPos, gEnd.pos) - (rFix.lookaheadS - L)) < 1e-9,
+        "外延点沿终点切向大圆 (err %.1e)",
+        std::fabs(R * angleBetween(rFix.lookaheadPos, gEnd.pos) - (rFix.lookaheadS - L)));
+
+  // 比例前视远场：ratio*remaining > cap 时取 cap（与固定前视一致）
+  const double ratio = 0.3, cap = 0.1 * L;
+  const TrackingRef rFar = computeTrackingRef(sp, p, h, u0, cap, ratio, 0.0);
+  CHECK(ratio * rFar.remaining > cap && std::fabs(rFar.lookaheadS - (rFar.s + cap)) < 1e-9,
+        "比例前视远场取上限 (rem=%.3f, cap=%.3f, sLd=%.3f)", rFar.remaining, cap, rFar.lookaheadS);
+
+  // 比例前视近场：Ld = ratio*remaining < cap，前视点在曲线上且平滑收缩
+  const double u1 = 5.5;
+  const Vec3 p1 = sp.pos(u1), h1 = sp.geom(u1).tangent;
+  const TrackingRef rNear = computeTrackingRef(sp, p1, h1, u1, cap, ratio, 0.0);
+  const double Ld1 = std::min(ratio * rNear.remaining, cap);
+  CHECK(Ld1 < cap && std::fabs(rNear.lookaheadS - (rNear.s + Ld1)) < 1e-9 && rNear.lookaheadS <= L,
+        "比例前视近场按剩余弧长收缩 (rem=%.3f, Ld=%.3f)", rNear.remaining, Ld1);
+  CHECK(angleBetween(rNear.lookaheadPos, sp.pos(sp.uOfS(rNear.lookaheadS))) < 1e-12,
+        "比例前视点落在曲线上");
+
+  // 终端吸附：remaining <= terminalDist 时跟踪点 = 终点本身
+  const TrackingRef rTerm = computeTrackingRef(sp, p1, h1, u1, cap, ratio, rNear.remaining + 1e-6);
+  CHECK(rTerm.lookaheadS == L && angleBetween(rTerm.lookaheadPos, gEnd.pos) < 1e-14,
+        "终端吸附取终点 (sLd=%.3f vs L=%.3f)", rTerm.lookaheadS, L);
+  // terminalDist = 0 关闭吸附（固定前视超出终点时仍走切向外延分支）
+  const TrackingRef rNo = computeTrackingRef(sp, p1, h1, u1, cap, 0.0, 0.0);
+  CHECK(rNo.lookaheadS != L && angleBetween(rNo.lookaheadPos, gEnd.pos) > 1e-9,
+        "terminalDist=0 时不吸附 (sLd=%.3f vs L=%.3f)", rNo.lookaheadS, L);
+}
+
 static void testPlannerBoundaryAndGradient() {
   PlannerParams prm;
   prm.R = 1000.0;
@@ -351,6 +393,7 @@ int main() {
   testQuadAndBasis();
   testGeometry();
   testPurePursuit();
+  testTrackingRefModes();
   testPlannerBoundaryAndGradient();
   testGoalLegAlignment();
   testHomotopySignature();

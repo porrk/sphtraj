@@ -49,6 +49,8 @@ planner.setKappaMax(1.0 / rMin);                  // 可选。freezeDistance / l
 // 每个控制周期：
 PlanStats st = planner.replan(state, v * latency);       // state = {p, h, 当前曲率}
 TrackingRef ref = planner.trackingReference(state, Ld);  // 横向误差/航向误差/前视点/曲率指令
+// 前视点选取（PlannerParams）：lookaheadRatio > 0 时 Ld_eff = min(ratio·remaining, Ld)，
+// 随剩余弧长按比例收缩；terminalDist > 0 且 remaining <= terminalDist 时跟踪点直接取终点。
 // 低频（1~5 Hz，可放后台线程）：
 planner.considerClassSwitch(state);
 

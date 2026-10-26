@@ -93,6 +93,9 @@ struct PlannerParams {
   int switchHoldCount = 3;    // 且连续满足的次数
   // ---- 前端引导段（让初值满足起终点航向）----
   double leadLength = -1;     // <0 自动 = 1/kappaMax
+  // ---- 跟踪参考（前视点选取）----
+  double lookaheadRatio = 0.0;  // >0 时按剩余弧长比例选前视点：Ld = min(ratio*remaining, lookahead)
+  double terminalDist = 0.0;    // 剩余弧长 <= 此值时跟踪点直接取终点；<=0 关闭
 
   void finalize() {
     if (frontEndExtraMargin < 0) frontEndExtraMargin = 0.5 * spanLength;
@@ -346,7 +349,8 @@ class SphereTrajPlanner {
   // ---------------- 跟踪参考量（最近点 / 横向误差 / 前视点 / 纯追踪曲率） ----------------
   TrackingRef trackingReference(const SurfaceState& meas, double lookahead) {
     if (!curve_.valid()) return {};
-    TrackingRef r = computeTrackingRef(curve_, meas.p.normalized(), meas.h, lastU_, lookahead);
+    TrackingRef r = computeTrackingRef(curve_, meas.p.normalized(), meas.h, lastU_, lookahead,
+                                        prm_.lookaheadRatio, prm_.terminalDist);
     lastU_ = r.u;
     return r;
   }
