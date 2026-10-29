@@ -91,6 +91,8 @@ struct PlannerParams {
   // ---- 同伦切换迟滞 ----
   double switchGain = 0.15;   // 新同伦类须短于当前剩余长度的 (1-gain)
   int switchHoldCount = 3;    // 且连续满足的次数
+  bool homotopyGuard = true;  // false 关闭重规划的同伦守卫：只要新解可行就直接接受，
+                              // 允许每周期任意换类（homotopyDiff 仍会计算并上报）
   // ---- 前端引导段（让初值满足起终点航向）----
   double leadLength = -1;     // <0 自动 = 1/kappaMax
   // ---- 跟踪参考（前视点选取）----
@@ -298,7 +300,7 @@ class SphereTrajPlanner {
     // 4) 校验 + 同伦签名比较
     const Validation vNew = validate(so.sp, 0.0);
     st.homotopyDiff = maxAbsDiff(signature(so.sp, 0.0), signature(old, u0));
-    const bool sameClass = st.homotopyDiff < kPi;
+    const bool sameClass = !prm_.homotopyGuard || st.homotopyDiff < kPi;
     fillStats(st, so, vNew, M);
     // 旧轨迹剩余段的校验只在需要做决策时才计算（常规周期省掉这部分开销）
     const bool needOld = !(vNew.ok && sameClass);

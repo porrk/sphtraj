@@ -51,7 +51,7 @@ def main():
         rows = read(p)
         ax.plot([float(r["lon"]) for r in rows], [float(r["lat"]) for r in rows], color=col, lw=lw, ls=ls, label=lab)
     ax.set_aspect("equal")
-    ax.set_ylim(-10, 60)
+    ax.set_ylim(0, 36)
     ax.set_xlabel("lon [deg]")
     ax.set_ylabel("lat [deg]")
     ax.legend(loc="lower right")
