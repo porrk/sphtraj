@@ -238,10 +238,8 @@ struct TrackingRef {
 
 // lookaheadRatio > 0 时按剩余弧长比例选前视点：Ld = min(lookaheadRatio*remaining, lookahead)，
 // 远场退化为固定前视，近场随剩余弧长按比例收缩，跟踪点平滑收敛到终点。
-// terminalDist > 0 且 remaining <= terminalDist 时跟踪点直接取终点（不做切向外延），
-// 保证终端精度。
 inline TrackingRef computeTrackingRef(const SphereSpline& sp, const Vec3& p, const Vec3& h, double uGuess,
-                                      double lookahead, double lookaheadRatio = 0.0, double terminalDist = 0.0) {
+                                      double lookahead, double lookaheadRatio = 0.0) {
   TrackingRef r;
   if (!sp.valid()) return r;
   const double R = sp.radius();
@@ -255,23 +253,16 @@ inline TrackingRef computeTrackingRef(const SphereSpline& sp, const Vec3& p, con
   r.headingError = std::atan2(Tp.cross(h).dot(p), Tp.dot(h));
   r.kappaRef = g.kappaU / R;
   r.remaining = sp.length() - r.s;
-  if (terminalDist > 0.0 && r.remaining <= terminalDist) {
-    // 近距终端：跟踪点 = 终点本身
-    r.lookaheadS = sp.length();
-    r.lookaheadPos = sp.pos(sp.uMax());
+  const double Ld = (lookaheadRatio > 0.0)
+                        ? std::min(lookaheadRatio * r.remaining, lookahead)
+                        : lookahead;
+  // 前视点超出终点时沿终点切向大圆外延（比例模式 Ld <= remaining，不会触发外延分支）
+  r.lookaheadS = r.s + Ld;
+  if (r.lookaheadS <= sp.length()) {
+    r.lookaheadPos = sp.pos(sp.uOfS(r.lookaheadS));
   } else {
-    const double Ld = (lookaheadRatio > 0.0)
-                          ? std::min(lookaheadRatio * r.remaining, lookahead)
-                          : lookahead;
-    // 前视点超出终点时沿终点切向大圆外延，使车辆以目标航向到达终点
-    //（比例模式 Ld <= remaining，不会触发外延分支）
-    r.lookaheadS = r.s + Ld;
-    if (r.lookaheadS <= sp.length()) {
-      r.lookaheadPos = sp.pos(sp.uOfS(r.lookaheadS));
-    } else {
-      const SphereSpline::Geom ge = sp.geom(sp.uMax());
-      r.lookaheadPos = geodesicStep(ge.pos, ge.tangent, (r.lookaheadS - sp.length()) / R);
-    }
+    const SphereSpline::Geom ge = sp.geom(sp.uMax());
+    r.lookaheadPos = geodesicStep(ge.pos, ge.tangent, (r.lookaheadS - sp.length()) / R);
   }
   r.kappaPurePursuit = purePursuitCurvature(p, h, r.lookaheadPos, R);
   return r;

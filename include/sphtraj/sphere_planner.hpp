@@ -1,20 +1,20 @@
 #pragma once
-// 方案 A：球面中心投影 B 样条轨迹优化 + 切线图前端 + 每周期重规划（同伦一致性）。
+// 简化版：球面中心投影 B 样条轨迹优化 + 切线图前端 + 每周期重规划。
+// 目标只有两个 —— 规避禁飞区、到达终点区域。无终端航向约束、无同伦守卫、
+// 无近端冻结、无曲率硬上限；曲率以软罚正则（幅值 + 变化率）。
 //
 // 曲线：c(u) = Σ N_j(u) P_j（R^3 夹持三次 B 样条），γ = c/|c|。
 // 边界条件（构造式精确满足）：
-//   P0 = ps, P1 = ps + a_s hs                  → 起点航向精确
-//   P_{M+2} = pg, P_{M+1} = pg - a_g hg         → 终点航向精确
-//   ℓs·P2 = 3 a_s² κ0  (ℓs = ps × hs)           → 起点曲率 = 当前曲率（可选，保证转向指令连续）
-//   ℓg·P_M = 3 a_g² κg (ℓg = pg × hg)           → 终点曲率（可选）
-// 代价：J = wE·E + wB·B + wK·K + wO·O + wR·Rad + wP·Prox + wL·Leg
+//   P0 = ps, P1 = ps + a_s hs                  → 起点航向精确（转向连续）
+//   ℓs·P2 = 3 a_s² κ0  (ℓs = ps × hs)           → 起点曲率 = 当前曲率（可选）
+//   P_{M+2} = pg；P_M、P_{M+1} 自由              → 终端航向由优化决定
+// 代价：J = wE·E + wB·B + wKv·Kv + wSp·Sp + wO·O + wR·Rad
 //   E   = M ∫|γ'|² du / Lref²         （≥ (L/Lref)²，等号当且仅当匀速 → 最短且近似弧长参数化）
-//   B   = ∫ κ² ds / (κlim² Lref)      （弯曲能量正则）
-//   K   = (1/M) ∫ [max(0, |κ|/κlim - 1)³ + max(0, 1 - |γ'|/smin)³] du   （曲率上限 + 速度下限防尖点）
+//   B   = ∫ κ² ds / (κref² Lref)      （曲率幅值软罚：κref = kappaMax·R 仅作归一化尺度）
+//   Kv  = (1/M) Σ_q (Δκ_q/κref)²·(spanU/Δs_q)   （曲率变化率软罚：相邻采样点曲率差）
+//   Sp  = (1/M) ∫ max(0, 1 - |γ'|/smin)³ du     （参数速度下限，防尖点/打结）
 //   O   = (1/M) ∫ Σ_i max(0, (γ·n_i - cos r_i)/(sin r_i σ))³ du
 //   Rad = Σ (|P_j|² - 1)²             （消除径向冗余自由度）
-//   Prox= Σ |P_j - P_j^warm|² / Δ²    （近端项：相邻周期一致性）
-//   Leg = Σ_j ω_j (ℓg·P_j)² / Δ²      （末段对齐：尾部控制点拉到终端大圆平面，见 goalLegLength）
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -48,37 +48,27 @@ struct Obstacle {
 struct PlannerParams {
   // ---- 几何 ----
   double R = 1.0;             // 球半径（物理单位）
-  double kappaMax = 1.0;      // 最大测地曲率（1/物理长度）
+  double kappaMax = 1.0;      // 参考测地曲率（1/物理长度）。不是约束：仅作曲率罚项的
+                              // 归一化尺度与前端引导段长度 (leadLength 自动值) 的基准。
   double spanLength = 0.1;    // 每个 knot span 期望弧长（物理）
   int minSpans = 4, maxSpans = 80;
   int quadNodes = 5;          // 每 span 的 Gauss-Legendre 节点数
   // ---- 边界条件 ----
-  bool pinStartCurvature = true;
-  bool pinGoalHeading = true;  // 终端切向钉死到目标航向 hg (P_{M+1} = pg - a_g*hg)。false 时
-                               // P_{M+1} 自由, 终端航向由优化自行决定 (忽略到达角约束)。
-  bool pinGoalCurvature = false;
-  double goalCurvature = 0.0;  // 1/物理长度
-  double goalLeadLength = -1;  // 终点切向臂 a_g 目标长度（物理）。<0 自动（能量项收敛到 ≈ spanLength/3）。
-                               // 已由 goalLegLength 覆盖，保留仅为兼容旧绑定/旧配置；新调用方不要设。
-  double wGoalLead = 30.0;     // 切向臂罚项权重（相对偏差平方）
-  double goalLegLength = -1;   // 末段“沿到达航向大圆”的对齐航线目标长度（物理）。<=0 关闭。
-                               // 一个 span 的 4 个控制点若都落在终端大圆平面（ℓg·P = 0）上，
-                               // 该 span 就精确落在该大圆上；本项按到终点的距离给尾部控制点
-                               // 加权拉向该平面，使飞行器尽早对齐到达航向。每多拉入一个控制点
-                               // 就多出约一个 span 的对齐段，因而可以设得远大于 spanLength。
-                               // 软罚项：与禁飞区/曲率上限冲突时自动缩短；窗口还按剩余航程的
-                               // kLegReachFrac 封顶，过大目标不会把解拉坏。
-  double wGoalLeg = 20.0;      // 末段对齐罚项权重（偏差按 spanLength 归一化后平方）
+  bool pinStartCurvature = true;  // 起点曲率 = 实测曲率（replan 转向连续）
   // ---- 安全裕度（物理长度）----
   double optMargin = 0.0;            // 优化时额外膨胀
   double checkMargin = 0.0;          // 校验时额外膨胀（应小于 optMargin）
   double frontEndExtraMargin = -1;   // 前端额外膨胀，<0 自动 = 0.5*spanLength
   // ---- 代价权重 ----
-  double wEnergy = 1.0, wBend = 0.02, wCurv = 1e3, wObs = 1e4, wRadial = 1.0, wProx = 0.05;
-  double curvSafety = 0.9;    // 优化中使用 curvSafety*kappaMax 作为曲率上限
-  double minSpeedFrac = 0.3;  // 参数速度下限 = minSpeedFrac * L/M（防止尖点/打结）
-  double maxStepFrac = 0.5;   // L-BFGS 每步控制点最大位移 = maxStepFrac * spanLength
-  double obsScale = -1;       // 穿透量归一化尺度（物理），<0 自动 = 0.2*spanLength
+  double wEnergy = 1.0;        // 能量（最短 + 匀速参数化）
+  double wBend = 0.02;         // 曲率幅值软罚 ∫κ² ds
+  double wKappaVar = 1e3;      // 曲率变化率软罚 Σ(Δκ)²/Δs（相邻采样点曲率差）
+  double wSpeed = 1e3;         // 参数速度下限罚权重（防尖点/打结）
+  double wObs = 1e4;           // 障碍穿透罚
+  double wRadial = 1.0;        // 径向正则
+  double minSpeedFrac = 0.3;   // 参数速度下限 = minSpeedFrac * L/M（防止尖点/打结）
+  double maxStepFrac = 0.5;    // L-BFGS 每步控制点最大位移 = maxStepFrac * spanLength
+  double obsScale = -1;        // 穿透量归一化尺度（物理），<0 自动 = 0.2*spanLength
   // ---- 求解器 ----
   LbfgsParams lbfgsFull;      // 从零规划
   LbfgsParams lbfgsReplan;    // 每周期重规划（热启动）
@@ -86,26 +76,17 @@ struct PlannerParams {
   double stitchPosTol = -1;               // <0 自动 = 0.5*spanLength
   double stitchHeadingTol = deg2rad(15);  // rad
   double spanRatioLo = 0.7, spanRatioHi = 1.4;  // span 数迟滞
-  double freezeDistance = -1;             // 剩余长度小于此值停止重规划，<0 自动 = 1/kappaMax
   // ---- 校验 ----
   double checkStep = -1;      // 校验采样步长（物理），<0 自动 = 0.1*spanLength
-  double curvTolerance = 1.05;
-  // ---- 同伦切换迟滞 ----
-  double switchGain = 0.15;   // 新同伦类须短于当前剩余长度的 (1-gain)
-  int switchHoldCount = 3;    // 且连续满足的次数
-  bool homotopyGuard = true;  // false 关闭重规划的同伦守卫：只要新解可行就直接接受，
-                              // 允许每周期任意换类（homotopyDiff 仍会计算并上报）
-  // ---- 前端引导段（让初值满足起终点航向）----
+  // ---- 前端引导段（让初值满足起点航向）----
   double leadLength = -1;     // <0 自动 = 1/kappaMax
   // ---- 跟踪参考（前视点选取）----
   double lookaheadRatio = 0.0;  // >0 时按剩余弧长比例选前视点：Ld = min(ratio*remaining, lookahead)
-  double terminalDist = 0.0;    // 剩余弧长 <= 此值时跟踪点直接取终点；<=0 关闭
 
   void finalize() {
     if (frontEndExtraMargin < 0) frontEndExtraMargin = 0.5 * spanLength;
     if (obsScale < 0) obsScale = 0.2 * spanLength;
     if (stitchPosTol < 0) stitchPosTol = 0.5 * spanLength;
-    if (freezeDistance < 0) freezeDistance = 1.0 / kappaMax;
     if (checkStep < 0) checkStep = 0.1 * spanLength;
     if (leadLength < 0) leadLength = 1.0 / kappaMax;
     minSpans = std::max(minSpans, 3);
@@ -119,23 +100,17 @@ struct PlannerParams {
 };
 
 enum class PlanStatus {
-  Ok,                          // 接受新解，同伦类不变
-  ClassChangedForced,          // 旧路径已不可行，接受了不同同伦类的新解
-  KeptPreviousHomotopyGuard,   // 新解改变了同伦类而旧解仍可行 → 保留旧解
-  KeptPreviousInfeasible,      // 新解校验失败 → 保留旧解
-  FrontEndReplan,              // 新旧都不可行 → 前端重新规划
-  Frozen,                      // 接近终点，冻结
+  Ok,                      // 接受新解
+  KeptPreviousInfeasible,  // 新解校验失败 → 保留旧解
+  FrontEndReplan,          // 新旧都不可行 → 前端重新规划
   Failed
 };
 
 inline const char* toString(PlanStatus s) {
   switch (s) {
     case PlanStatus::Ok: return "Ok";
-    case PlanStatus::ClassChangedForced: return "ClassChangedForced";
-    case PlanStatus::KeptPreviousHomotopyGuard: return "KeptPreviousHomotopyGuard";
     case PlanStatus::KeptPreviousInfeasible: return "KeptPreviousInfeasible";
     case PlanStatus::FrontEndReplan: return "FrontEndReplan";
-    case PlanStatus::Frozen: return "Frozen";
     default: return "Failed";
   }
 }
@@ -143,25 +118,21 @@ inline const char* toString(PlanStatus s) {
 struct PlanStats {
   PlanStatus status = PlanStatus::Failed;
   // valid / length / minClearance / maxKappa / spans 描述规划器里保留的那条曲线。
-  // 新候选被拒绝时，这些字段仍属于继续跟踪的旧曲线；冻结时 valid 来自剩余段的校验。
-  // iters / evals / cost / homotopyDiff 描述本周期尝试的那次求解。
+  // 新候选被拒绝时，这些字段仍属于继续跟踪的旧曲线。
+  // iters / evals / cost 描述本周期尝试的那次求解。
   bool valid = false;
   double solveMs = 0.0;
   int iters = 0, evals = 0;
   double cost = 0.0;
   double length = 0.0;          // 保留曲线的物理总长；没有保留曲线时为 0
   double minClearance = 0.0;    // 保留曲线受检段相对 radius+checkMargin 的间隔（物理）
-  double maxKappa = 0.0;        // 保留曲线受检段的最大物理曲率
-  double homotopyDiff = 0.0;    // 新旧签名最大差（rad）
+  double maxKappa = 0.0;        // 保留曲线受检段的最大物理曲率（统计上报，不设上限）
   int spans = 0;
   bool stitched = false;
 };
 
 class SphereTrajPlanner {
  public:
-  // 末段对齐窗口相对（剩余）航程的上限，见 makeProblem
-  static constexpr double kLegReachFrac = 0.4;
-
   struct Validation {
     bool ok = true;
     double minClearance = std::numeric_limits<double>::infinity();
@@ -169,31 +140,14 @@ class SphereTrajPlanner {
     double minCnorm = std::numeric_limits<double>::infinity();
   };
 
-  explicit SphereTrajPlanner(const PlannerParams& prm) : prm_(prm) {
-    // 必须在 finalize 把负数哨兵写成具体长度之前记下，之后 setKappaMax 才知道哪些是自动值。
-    freezeAuto_ = prm_.freezeDistance < 0.0;
-    leadAuto_ = prm_.leadLength < 0.0;
-    prm_.finalize();
-  }
+  explicit SphereTrajPlanner(const PlannerParams& prm) : prm_(prm) { prm_.finalize(); }
 
   void setObstacles(const std::vector<Obstacle>& obs) { obs_ = obs; }
   void addObstacle(const Obstacle& o) { obs_.push_back(o); }
   const std::vector<Obstacle>& obstacles() const { return obs_; }
-  // 速度相关机动能力：更新最大测地曲率（如转弯半径随速度变化，逐周期调用）。
-  // 构造时 freezeDistance / leadLength 仍为自动值（<0）时，才把它们改成 1/kappaMax。
-  // 调用方给过的正值保持不变。曲率上限变紧后，按旧上限规划的曲线可能不再满足校验。
-  void setKappaMax(double kappaMax) {
-    prm_.kappaMax = std::max(kappaMax, 1e-12);
-    if (freezeAuto_) prm_.freezeDistance = 1.0 / prm_.kappaMax;
-    if (leadAuto_) prm_.leadLength = 1.0 / prm_.kappaMax;
-  }
   void setGoal(const SurfaceState& g) {
     goal_ = normalizeState(g);
     hasGoal_ = true;
-  }
-  void setHomotopyPole(const Vec3& z) {
-    pole_ = z.normalized();
-    hasPole_ = true;
   }
   // 有一条曾通过校验并被采纳的曲线。从零规划失败不会留下落选的初值。
   bool hasPlan() const { return curve_.valid(); }
@@ -221,13 +175,11 @@ class SphereTrajPlanner {
     std::vector<double> x = toVars(pb.bd, P0, 0.3 * LU / (3.0 * M));
     SolveOut so = solve(pb, x, prm_.lbfgsFull);
     Validation v = validate(so.sp, 0.0);
-    for (int retry = 0; retry < 2 && !v.ok; ++retry) {  // 加大障碍/曲率权重再解
+    for (int retry = 0; retry < 2 && !v.ok; ++retry) {  // 加大障碍权重再解
       pb.wO *= 10.0;
-      pb.wK *= 10.0;
       so = solve(pb, so.x, prm_.lbfgsFull);
       v = validate(so.sp, 0.0);
     }
-    if (!hasPole_) setDefaultPole(start.p, goal_.p);
     if (v.ok) {
       curve_ = so.sp;
       lastU_ = 0.0;
@@ -251,8 +203,9 @@ class SphereTrajPlanner {
     return st;
   }
 
-  // ---------------- 每个控制周期调用：拼接 + 热启动 + 近端优化 + 校验 + 同伦守卫 ----------------
+  // ---------------- 每个控制周期调用：拼接 + 热启动 + 优化 + 校验 ----------------
   // advanceDist：计算/通信延迟期间车辆预计前进的距离（物理），拼接点取在其前方。
+  // 到达终点前持续重规划（无近端冻结）；新解可行即接受（无同伦守卫）。
   PlanStats replan(const SurfaceState& meas0, double advanceDist = 0.0) {
     const auto t0 = std::chrono::steady_clock::now();
     if (!curve_.valid()) return planFromScratch(meas0);
@@ -263,13 +216,6 @@ class SphereTrajPlanner {
     const double uV = old.closestU(meas.p, lastU_, 0.5, 3.0);
     lastU_ = uV;
     const double sV = old.sOfU(uV), L = old.length();
-    if (L - sV < prm_.freezeDistance) {
-      const Validation vFrozen = validate(old, uV);
-      st.status = PlanStatus::Frozen;
-      describeRetained(st, old, vFrozen);
-      st.solveMs = msSince(t0);
-      return st;
-    }
     // 1) 拼接：误差小时从旧轨迹上取起点状态（含曲率），否则用实测状态
     const SphereSpline::Geom gv = old.geom(uV);
     const double posErr = R * angleBetween(meas.p, gv.pos);
@@ -279,7 +225,7 @@ class SphereTrajPlanner {
     double u0;
     st.stitched = posErr <= prm_.stitchPosTol && std::fabs(hErr) <= prm_.stitchHeadingTol;
     if (st.stitched) {
-      u0 = old.uOfS(std::min(sV + advanceDist, L - 0.5 * prm_.freezeDistance));
+      u0 = old.uOfS(std::min(sV + advanceDist, L));
       const SphereSpline::Geom g0 = old.geom(u0);
       start = {g0.pos, g0.tangent, g0.kappaU / R};
     } else {
@@ -296,70 +242,42 @@ class SphereTrajPlanner {
     Problem pb = makeProblem(M, start, goal_, remU);
     const std::vector<Vec3> Pw = fitCtrl(M, pts, start.p, goal_.p);
     std::vector<double> x = toVars(pb.bd, Pw, 0.3 * remU / (3.0 * M));
-    buildCtrl(pb.bd, x, pb.anchors);  // 近端锚点
     // 3) 优化
     const SolveOut so = solve(pb, x, prm_.lbfgsReplan);
-    // 4) 校验 + 同伦签名比较
+    // 4) 校验：可行即接受
     const Validation vNew = validate(so.sp, 0.0);
-    st.homotopyDiff = maxAbsDiff(signature(so.sp, 0.0), signature(old, u0));
-    const bool sameClass = !prm_.homotopyGuard || st.homotopyDiff < kPi;
     fillStats(st, so, vNew, M);
-    // 旧轨迹剩余段的校验只在需要做决策时才计算（常规周期省掉这部分开销）
-    const bool needOld = !(vNew.ok && sameClass);
-    const Validation vOld = needOld ? validate(old, u0) : Validation{};
-    if (vNew.ok && (sameClass || !vOld.ok)) {
+    if (vNew.ok) {
       curve_ = so.sp;
       lastU_ = 0.0;
-      st.status = sameClass ? PlanStatus::Ok : PlanStatus::ClassChangedForced;
-    } else if (vNew.ok) {
-      st.status = PlanStatus::KeptPreviousHomotopyGuard;
-      describeRetained(st, old, vOld);
-    } else if (vOld.ok) {
-      st.status = PlanStatus::KeptPreviousInfeasible;
-      describeRetained(st, old, vOld);
+      st.status = PlanStatus::Ok;
     } else {
-      const PlanStats fs = planFromScratch(start);
-      const bool accepted = fs.valid;
-      st = fs;
-      st.status = accepted ? PlanStatus::FrontEndReplan : PlanStatus::Failed;
-      if (!accepted) describeRetained(st, curve_, curve_.valid() ? validate(curve_, u0) : Validation{});
+      const Validation vOld = validate(old, u0);
+      if (vOld.ok) {
+        st.status = PlanStatus::KeptPreviousInfeasible;
+        describeRetained(st, old, vOld);
+      } else {
+        const PlanStats fs = planFromScratch(start);
+        const bool accepted = fs.valid;
+        st = fs;
+        st.status = accepted ? PlanStatus::FrontEndReplan : PlanStatus::Failed;
+        if (!accepted) describeRetained(st, curve_, curve_.valid() ? validate(curve_, u0) : Validation{});
+      }
     }
     st.solveMs = msSince(t0);
     return st;
-  }
-
-  // ---------------- 低频调用（如 1~5 Hz）：带迟滞的同伦类主动切换 ----------------
-  bool considerClassSwitch(const SurfaceState& meas0) {
-    if (!curve_.valid()) return false;
-    const SurfaceState meas = normalizeState(meas0);
-    const double uV = curve_.closestU(meas.p, lastU_, 0.5, 3.0);
-    const double remaining = curve_.length() - curve_.sOfU(uV);
-    if (remaining < 2.0 * prm_.freezeDistance) return false;
-    std::vector<Vec3> poly;
-    if (!frontEnd(meas, goal_, poly)) {
-      switchHold_ = 0;
-      return false;
-    }
-    const double Lfe = polylineLength(poly) * prm_.R;
-    const double diff = maxAbsDiff(signatureOfPoints(poly), signature(curve_, uV));
-    if (diff > kPi && Lfe < (1.0 - prm_.switchGain) * remaining) ++switchHold_;
-    else switchHold_ = 0;
-    if (switchHold_ < prm_.switchHoldCount) return false;
-    switchHold_ = 0;
-    const PlanStats st = planFromScratch(meas);  // 仅在有效时替换 curve_
-    return st.valid;
   }
 
   // ---------------- 跟踪参考量（最近点 / 横向误差 / 前视点 / 纯追踪曲率） ----------------
   TrackingRef trackingReference(const SurfaceState& meas, double lookahead) {
     if (!curve_.valid()) return {};
     TrackingRef r = computeTrackingRef(curve_, meas.p.normalized(), meas.h, lastU_, lookahead,
-                                        prm_.lookaheadRatio, prm_.terminalDist);
+                                        prm_.lookaheadRatio);
     lastU_ = r.u;
     return r;
   }
 
-  // ---------------- 校验：碰撞（障碍半径 + checkMargin）、曲率、退化 ----------------
+  // ---------------- 校验：碰撞（障碍半径 + checkMargin）、退化 ----------------
   Validation validate(const SphereSpline& sp, double u0) const {
     Validation v;
     if (!sp.valid()) {
@@ -387,46 +305,8 @@ class SphereTrajPlanner {
         }
       }
     }
-    v.ok = v.minClearance >= 0.0 && v.maxKappa <= prm_.kappaMax * prm_.curvTolerance && v.minCnorm > 0.2;
+    v.ok = v.minClearance >= 0.0 && v.minCnorm > 0.2;  // maxKappa 仅统计上报（无曲率硬上限）
     return v;
-  }
-
-  // ---------------- 同伦签名（球面版 H-signature） ----------------
-  // 以 pole 为极点做球极投影，累计路径绕每个障碍像点的转角。
-  std::vector<double> signatureOfPoints(const std::vector<Vec3>& pts) const {
-    const StereoChart chart(pole_);
-    std::vector<std::pair<double, double>> oc;
-    for (const Obstacle& o : obs_) {
-      double a = 0, b = 0;
-      if (angleBetween(o.center, pole_) * prm_.R < o.radius || !chart.project(o.center, a, b)) {
-        oc.push_back({std::numeric_limits<double>::quiet_NaN(), 0.0});  // 含极点的障碍：作为外边界，不计
-      } else {
-        oc.push_back({a, b});
-      }
-    }
-    std::vector<double> w(obs_.size(), 0.0);
-    bool havePrev = false;
-    double pu = 0, pv = 0;
-    for (const Vec3& x : pts) {
-      double u, v;
-      if (!chart.project(x, u, v)) continue;
-      if (havePrev) {
-        for (size_t i = 0; i < oc.size(); ++i) {
-          if (std::isnan(oc[i].first)) continue;
-          const double ax = pu - oc[i].first, ay = pv - oc[i].second;
-          const double bx = u - oc[i].first, by = v - oc[i].second;
-          w[i] += std::atan2(ax * by - ay * bx, ax * bx + ay * by);
-        }
-      }
-      pu = u;
-      pv = v;
-      havePrev = true;
-    }
-    return w;
-  }
-  std::vector<double> signature(const SphereSpline& sp, double u0) const {
-    const double stepU = std::min(prm_.checkStep / prm_.R, deg2rad(0.5));
-    return signatureOfPoints(sp.samplePositions(u0, stepU));
   }
 
   // ---------------- 诊断：解析梯度 vs 中心差分（返回最大误差 / 最大梯度分量） ----------------
@@ -437,17 +317,15 @@ class SphereTrajPlanner {
     const double LU = polylineLength(poly);
     const int M = std::clamp(static_cast<int>(std::ceil(LU * prm_.R / prm_.spanLength)), prm_.minSpans, prm_.maxSpans);
     Problem pb = makeProblem(M, start, goal_, LU);
-    for (CapOpt& c : pb.caps) {  // 放大障碍、收紧曲率，让所有罚项都处于激活状态
+    for (CapOpt& c : pb.caps) {  // 放大障碍，让穿透罚项处于激活状态
       c.r *= 1.6;
       c.cosr = std::cos(c.r);
       c.sinr = std::sin(c.r);
     }
-    pb.kapLimU *= 0.3;
     std::vector<Vec3> P0 = fitCtrl(M, resamplePolyline(poly, 4 * M + 1), start.p, goal_.p);
     std::vector<double> x = toVars(pb.bd, P0, 0.3 * LU / (3.0 * M));
     std::mt19937 rng(seed);
     std::normal_distribution<double> nd(0.0, 0.01);
-    buildCtrl(pb.bd, x, pb.anchors);
     for (double& xi : x) xi += nd(rng);
     std::vector<double> g, gtmp;
     costGrad(pb, x, g);
@@ -468,35 +346,30 @@ class SphereTrajPlanner {
   // ======================= 内部数据结构 =======================
   struct Boundary {
     int M = 0;
-    Vec3 ps, hs, ls, pg, hg, lg;
-    double kapS = 0.0, kapG = 0.0;  // 单位球曲率
-    bool pinS = true, pinG = false;
-    bool pinH = true;  // 终端切向钉死 (P_{M+1} = pg - a_g*hg)；false 时 P_{M+1} 为自由控制点 (3 变量)
-    int numVars() const { return 2 + (pinS ? 2 : 3) + 3 * (M - 3) + (pinG ? 2 : 3) + (pinH ? 0 : 3); }
+    Vec3 ps, hs, ls, pg;          // 起点 (位置/航向/侧向) 与终点位置；终点航向不约束
+    double kapS = 0.0;            // 单位球曲率
+    bool pinS = true;
+    int numVars() const { return 1 + (pinS ? 2 : 3) + 3 * (M - 3) + 6; }  // P_M 与 P_{M+1} 恒自由
   };
   struct CapOpt {
     Vec3 n;
     double r = 0, cosr = 1, sinr = 0;
   };
   // 采样表：每个 span 含 nq 个 Gauss-Legendre 节点（用于积分项与罚项）
-  // + 节点 u=k（以及最后一个 span 的 u=M）处的附加点（仅用于曲率/障碍罚项，防止端点处曲率尖峰漏检）
+  // + 节点 u=k（以及最后一个 span 的 u=M）处的附加点（仅用于罚项，防止端点处尖峰漏检）
   struct SampleTable {
     int M = 0, nq = 0;
     std::vector<int> offset;                // span k 的样本为 [offset[k], offset[k+1])
     std::vector<double> wInt, wPen;         // 积分项权重 / 罚项权重（u 测度）
+    std::vector<double> u;                  // 每个样本的参数 u（曲率变化罚项用，全局按 u 递增）
     std::vector<std::array<double, 12>> N;  // N[d*4+j]
   };
   struct Problem {
     Boundary bd;
     const SampleTable* tab = nullptr;
     std::vector<CapOpt> caps;
-    double LrefU = 1, kapLimU = 1, obsScaleU = 1, proxScaleU = 1, sMinU = 0;
-    double wE = 1, wB = 0, wK = 0, wO = 0, wR = 0, wP = 0;
-    double agTargetU = -1, wLead = 0;  // 终点切向臂目标（单位球）与罚项权重；wLead=0 不加
-    Vec3 legN;                  // 终端大圆平面法向 ℓg = pg × hg
-    double legScaleU = 1, wLeg = 0;    // 末段对齐偏差归一化尺度与权重；wLeg=0 不加
-    std::vector<double> legW;   // 每个控制点的对齐权重 ω_j（为空则不加）
-    std::vector<Vec3> anchors;  // 为空则不加近端项
+    double LrefU = 1, kapRefU = 1, obsScaleU = 1, sMinU = 0;
+    double wE = 1, wB = 0, wKv = 0, wSp = 0, wO = 0, wR = 0;
   };
   struct SolveOut {
     std::vector<double> x;
@@ -514,8 +387,8 @@ class SphereTrajPlanner {
   static void buildCtrl(const Boundary& b, const std::vector<double>& x, std::vector<Vec3>& P) {
     const int M = b.M;
     P.resize(M + 3);
-    const double as = std::exp(x[0]), ag = std::exp(x[1]);
-    int k = 2;
+    const double as = std::exp(x[0]);
+    int k = 1;
     P[0] = b.ps;
     P[1] = b.ps + b.hs * as;
     if (b.pinS) {
@@ -526,19 +399,9 @@ class SphereTrajPlanner {
       k += 3;
     }
     for (int j = 3; j <= M - 1; ++j, k += 3) P[j] = Vec3(x[k], x[k + 1], x[k + 2]);
-    if (b.pinG) {
-      P[M] = b.pg * x[k] + b.hg * x[k + 1] + b.lg * (3.0 * ag * ag * b.kapG);
-      k += 2;
-    } else {
-      P[M] = Vec3(x[k], x[k + 1], x[k + 2]);
-      k += 3;
-    }
-    if (b.pinH) {
-      P[M + 1] = b.pg - b.hg * ag;
-    } else {
-      P[M + 1] = Vec3(x[k], x[k + 1], x[k + 2]);
-      k += 3;
-    }
+    P[M] = Vec3(x[k], x[k + 1], x[k + 2]);
+    k += 3;
+    P[M + 1] = Vec3(x[k], x[k + 1], x[k + 2]);
     P[M + 2] = b.pg;
   }
 
@@ -546,10 +409,9 @@ class SphereTrajPlanner {
                         std::vector<double>& g) {
     const int M = b.M;
     g.assign(x.size(), 0.0);
-    const double as = std::exp(x[0]), ag = std::exp(x[1]);
+    const double as = std::exp(x[0]);
     g[0] = gP[1].dot(b.hs) * as;
-    if (b.pinH) g[1] = -gP[M + 1].dot(b.hg) * ag;  // !pinH 时 a_g 不再驱动 P_{M+1}, 梯度恒 0
-    int k = 2;
+    int k = 1;
     auto put3 = [&](const Vec3& v) {
       g[k] = v.x;
       g[k + 1] = v.y;
@@ -565,23 +427,15 @@ class SphereTrajPlanner {
       put3(gP[2]);
     }
     for (int j = 3; j <= M - 1; ++j) put3(gP[j]);
-    if (b.pinG) {
-      g[1] += gP[M].dot(b.lg) * 6.0 * ag * ag * b.kapG;
-      g[k] = gP[M].dot(b.pg);
-      g[k + 1] = gP[M].dot(b.hg);
-      k += 2;
-    } else {
-      put3(gP[M]);
-    }
-    if (!b.pinH) put3(gP[M + 1]);
+    put3(gP[M]);
+    put3(gP[M + 1]);
   }
 
   static std::vector<double> toVars(const Boundary& b, const std::vector<Vec3>& P, double aMin) {
     const int M = b.M;
     std::vector<double> x(b.numVars());
     x[0] = std::log(std::max((P[1] - b.ps).dot(b.hs), aMin));
-    x[1] = std::log(std::max((b.pg - P[M + 1]).dot(b.hg), aMin));
-    int k = 2;
+    int k = 1;
     auto put3 = [&](const Vec3& v) {
       x[k] = v.x;
       x[k + 1] = v.y;
@@ -596,21 +450,42 @@ class SphereTrajPlanner {
       put3(P[2]);
     }
     for (int j = 3; j <= M - 1; ++j) put3(P[j]);
-    if (b.pinG) {
-      x[k] = P[M].dot(b.pg);
-      x[k + 1] = P[M].dot(b.hg);
-      k += 2;
-    } else {
-      put3(P[M]);
-    }
-    if (!b.pinH) put3(P[M + 1]);
+    put3(P[M]);
+    put3(P[M + 1]);
     return x;
   }
 
   // ======================= 代价与梯度 =======================
-  // 单个采样点的形状项（能量、弯曲、曲率上限）及其对 (c, c', c'') 的梯度（手推解析式）
-  static double shapeTerm(const Vec3& c, const Vec3& c1, const Vec3& c2, double aE, double aB, double aK,
-                          double kapLim, double sMin, Vec3& gc, Vec3& gc1, Vec3& gc2) {
+  // 每采样点几何量与偏导（κ = 单位球测地曲率, s = 单位球弧长速率 ds/du）
+  struct GeomPart {
+    double kap = 0.0, s = 0.0;
+    double dk_dr2 = 0, dk_dW2 = 0, dk_dd = 0;  // ∂κ/∂(r2, W2, d)
+    double ds_dW2 = 0, ds_dr2 = 0;             // ∂s/∂(r2, W2)
+    bool ok = false;                           // W2 > 0（非退化）
+  };
+  static GeomPart geomPart(const Vec3& c, const Vec3& c1, const Vec3& c2) {
+    GeomPart gp;
+    const double r2 = c.squaredNorm();
+    const Vec3 wv = c.cross(c1);
+    const double W2 = wv.squaredNorm();
+    if (W2 <= 1e-24) return gp;
+    const double r = std::sqrt(r2), W = std::sqrt(W2);
+    const double d = wv.dot(c2);
+    gp.kap = r2 * r * d / (W2 * W);
+    gp.s = W / r2;
+    gp.dk_dr2 = 1.5 * gp.kap / r2;
+    gp.dk_dW2 = -1.5 * gp.kap / W2;
+    gp.dk_dd = r2 * r / (W2 * W);
+    gp.ds_dW2 = 0.5 / (W * r2);
+    gp.ds_dr2 = -W / (r2 * r2);
+    gp.ok = true;
+    return gp;
+  }
+
+  // 点状代价（能量 + 曲率幅值软罚 + 参数速度下限）及其对 (c, c', c'') 的梯度（手推解析式）
+  static double pointwiseTerm(const Vec3& c, const Vec3& c1, const Vec3& c2, const GeomPart& gp,
+                              double aE, double aB, double aSp, double sMin,
+                              Vec3& gc, Vec3& gc1, Vec3& gc2) {
     const double r2 = c.squaredNorm();
     const Vec3 wv = c.cross(c1);
     const double W2 = wv.squaredNorm();
@@ -618,34 +493,38 @@ class SphereTrajPlanner {
     double dW2 = aE / (r2 * r2);
     double dr2 = -2.0 * aE * W2 / (r2 * r2 * r2);
     double dd = 0.0;
-    if (W2 > 1e-24) {
-      const double r = std::sqrt(r2), W = std::sqrt(W2);
-      const double d = wv.dot(c2);
-      const double s = W / r2;
-      const double kap = r2 * r * d / (W2 * W);
-      const double dk_dr2 = 1.5 * kap / r2, dk_dW2 = -1.5 * kap / W2, dk_dd = r2 * r / (W2 * W);
-      const double ds_dW2 = 0.5 / (W * r2), ds_dr2 = -W / (r2 * r2);
-      J += aB * kap * kap * s;
-      double gk = aB * 2.0 * kap * s, gs = aB * kap * kap;
-      const double v = (std::fabs(kap) - kapLim) / kapLim;
-      if (v > 0) {
-        J += aK * v * v * v;
-        gk += aK * 3.0 * v * v * (kap > 0 ? 1.0 : -1.0) / kapLim;
-      }
-      const double vs = (sMin - s) / sMin;  // 速度下限
+    if (gp.ok) {
+      J += aB * gp.kap * gp.kap * gp.s;   // ∫κ² ds 的离散项
+      double gk = aB * 2.0 * gp.kap * gp.s, gs = aB * gp.kap * gp.kap;
+      const double vs = (sMin - gp.s) / sMin;  // 速度下限
       if (vs > 0) {
-        J += aK * vs * vs * vs;
-        gs -= aK * 3.0 * vs * vs / sMin;
+        J += aSp * vs * vs * vs;
+        gs -= aSp * 3.0 * vs * vs / sMin;
       }
-      dW2 += gk * dk_dW2 + gs * ds_dW2;
-      dr2 += gk * dk_dr2 + gs * ds_dr2;
-      dd += gk * dk_dd;
+      dW2 += gk * gp.dk_dW2 + gs * gp.ds_dW2;
+      dr2 += gk * gp.dk_dr2 + gs * gp.ds_dr2;
+      dd += gk * gp.dk_dd;
     }
     // ∂r2/∂c = 2c；∂W2/∂c = 2 c'×w；∂W2/∂c' = 2 w×c；∂d/∂c = c'×c''；∂d/∂c' = c''×c；∂d/∂c'' = w
     gc = c * (2.0 * dr2) + c1.cross(wv) * (2.0 * dW2) + c1.cross(c2) * dd;
     gc1 = wv.cross(c) * (2.0 * dW2) + c2.cross(c) * dd;
     gc2 = wv * dd;
     return J;
+  }
+
+  // 曲率变化罚项的 (κ, s) 梯度回传到 (c, c', c'')
+  static void kapSGrad(const Vec3& c, const Vec3& c1, const Vec3& c2, const Vec3& wv, const GeomPart& gp,
+                       double gkap, double gs, Vec3& gc, Vec3& gc1, Vec3& gc2) {
+    if (!gp.ok || (gkap == 0.0 && gs == 0.0)) {
+      gc = gc1 = gc2 = Vec3();
+      return;
+    }
+    const double gr2 = gkap * gp.dk_dr2 + gs * gp.ds_dr2;
+    const double gW2 = gkap * gp.dk_dW2 + gs * gp.ds_dW2;
+    const double gd = gkap * gp.dk_dd;
+    gc = c * (2.0 * gr2) + c1.cross(wv) * (2.0 * gW2) + c1.cross(c2) * gd;
+    gc1 = wv.cross(c) * (2.0 * gW2) + c2.cross(c) * gd;
+    gc2 = wv * gd;
   }
 
   double costGrad(const Problem& pb, const std::vector<double>& x, std::vector<double>& g) {
@@ -655,37 +534,22 @@ class SphereTrajPlanner {
     buildCtrl(pb.bd, x, P);
     gP.assign(M + 3, Vec3());
     double J = 0.0;
-    // 径向正则
-    for (int j = 2; j <= M; ++j) {
+    // 径向正则（P_{M+1} 现为自由控制点, 一并拉回单位球; P_1 由边界式保持良态）
+    for (int j = 2; j <= M + 1; ++j) {
       const double e = P[j].squaredNorm() - 1.0;
       J += pb.wR * e * e;
       gP[j] += P[j] * (4.0 * pb.wR * e);
     }
-    // 末段对齐项：把尾部控制点拉到终端大圆平面 ℓg·P = 0 上
-    if (!pb.legW.empty() && pb.wLeg > 0) {
-      const double s = pb.wLeg / (pb.legScaleU * pb.legScaleU);
-      for (int j = 2; j <= M; ++j) {
-        if (pb.legW[j] <= 0.0) continue;
-        const double e = P[j].dot(pb.legN);
-        const double sw = s * pb.legW[j];
-        J += sw * e * e;
-        gP[j] += pb.legN * (2.0 * sw * e);
-      }
-    }
-    // 近端项
-    if (!pb.anchors.empty() && pb.wP > 0) {
-      const double s = pb.wP / (pb.proxScaleU * pb.proxScaleU);
-      for (int j = 1; j <= M + 1; ++j) {
-        const Vec3 d = P[j] - pb.anchors[j];
-        J += s * d.squaredNorm();
-        gP[j] += d * (2.0 * s);
-      }
-    }
-    // 采样点项
+    // 采样点项（点状部分），并记录每采样点的 (κ, s) 供曲率变化罚项使用
     const SampleTable& tab = *pb.tab;
+    const int nS = static_cast<int>(tab.N.size());
+    std::vector<double>& kap = bufKap_;
+    std::vector<double>& sp = bufS_;
+    kap.assign(nS, 0.0);
+    sp.assign(nS, 0.0);
     const double aE0 = pb.wE * M / (pb.LrefU * pb.LrefU);
-    const double aB0 = pb.wB / (pb.kapLimU * pb.kapLimU * pb.LrefU);
-    const double aK0 = pb.wK / M, aO0 = pb.wO / M;
+    const double aB0 = pb.wB / (pb.kapRefU * pb.kapRefU * pb.LrefU);
+    const double aSp0 = pb.wSp / M, aO0 = pb.wO / M;
     std::vector<int>& nearIdx = bufNear_;
     for (int k = 0; k < M; ++k) {
       // 凸包性质：该 span 落在其 4 个控制点的包围球冠内 → 精确剔除远处障碍
@@ -712,8 +576,11 @@ class SphereTrajPlanner {
           c1 += P[k + j] * N[4 + j];
           c2 += P[k + j] * N[8 + j];
         }
+        const GeomPart gp = geomPart(c, c1, c2);
+        kap[q] = gp.kap;
+        sp[q] = gp.s;
         Vec3 gc, gc1, gc2;
-        J += shapeTerm(c, c1, c2, aE0 * w, aB0 * w, aK0 * wp, pb.kapLimU, pb.sMinU, gc, gc1, gc2);
+        J += pointwiseTerm(c, c1, c2, gp, aE0 * w, aB0 * w, aSp0 * wp, pb.sMinU, gc, gc1, gc2);
         if (!nearIdx.empty()) {
           const double r = c.norm();
           const Vec3 gam = c / r;
@@ -730,14 +597,50 @@ class SphereTrajPlanner {
         for (int j = 0; j < 4; ++j) gP[k + j] += gc * N[j] + gc1 * N[4 + j] + gc2 * N[8 + j];
       }
     }
-    chainGrad(pb.bd, x, gP, g);
-    // 终点切向臂罚项：J += wLead·((a_g − a_g*)/a_g*)²，a_g = e^{x[1]}（P_{M+1} = pg − a_g·hg 的臂长）
-    if (pb.wLead > 0 && pb.agTargetU > 0) {
-      const double ag = std::exp(x[1]);
-      const double rel = (ag - pb.agTargetU) / pb.agTargetU;
-      J += pb.wLead * rel * rel;
-      g[1] += 2.0 * pb.wLead * rel * ag / pb.agTargetU;
+    // 曲率变化率软罚：J += (wKv/M)·Σ_q (Δκ_q/κref)²·(spanU/Δs_q)，
+    // Δs_q = 0.5(s_q + s_{q+1})·Δu（单位球弧长增量）。κ 在一个 span 内变化一个 κref
+    // 量级时整体贡献 ≈ wKv，与其它 O(1) 代价项同尺度。
+    if (pb.wKv > 0 && nS > 1) {
+      std::vector<double>& gk = bufGK_;
+      std::vector<double>& gs = bufGS_;
+      gk.assign(nS, 0.0);
+      gs.assign(nS, 0.0);
+      const double spanU = pb.LrefU / M;
+      const double wVar = pb.wKv / M / (pb.kapRefU * pb.kapRefU);
+      for (int q = 0; q + 1 < nS; ++q) {
+        const double du = tab.u[q + 1] - tab.u[q];
+        if (du <= 0.0) continue;
+        const double dkap = kap[q + 1] - kap[q];
+        const double dsU = 0.5 * (sp[q] + sp[q + 1]) * du;
+        if (dsU <= 1e-12) continue;
+        const double c0 = wVar * spanU / dsU;
+        J += c0 * dkap * dkap;
+        const double gd = 2.0 * c0 * dkap;               // ∂J/∂(Δκ)
+        gk[q] -= gd;
+        gk[q + 1] += gd;
+        const double ges = -c0 * dkap * dkap / dsU;      // ∂J/∂(Δs)
+        gs[q] += ges * 0.5 * du;
+        gs[q + 1] += ges * 0.5 * du;
+      }
+      // (κ, s) 梯度回传到控制点
+      for (int k = 0; k < M; ++k) {
+        for (int q = tab.offset[k]; q < tab.offset[k + 1]; ++q) {
+          if (gk[q] == 0.0 && gs[q] == 0.0) continue;
+          const std::array<double, 12>& N = tab.N[q];
+          Vec3 c, c1, c2;
+          for (int j = 0; j < 4; ++j) {
+            c += P[k + j] * N[j];
+            c1 += P[k + j] * N[4 + j];
+            c2 += P[k + j] * N[8 + j];
+          }
+          const GeomPart gp = geomPart(c, c1, c2);
+          Vec3 gc, gc1, gc2;
+          kapSGrad(c, c1, c2, c.cross(c1), gp, gk[q], gs[q], gc, gc1, gc2);
+          for (int j = 0; j < 4; ++j) gP[k + j] += gc * N[j] + gc1 * N[4 + j] + gc2 * N[8 + j];
+        }
+      }
     }
+    chainGrad(pb.bd, x, gP, g);
     return J;
   }
 
@@ -773,6 +676,7 @@ class SphereTrajPlanner {
       t.N.push_back(a);
       t.wInt.push_back(wInt);
       t.wPen.push_back(wPen);
+      t.u.push_back(u);
     };
     for (int k = 0; k < M; ++k) {
       t.offset.push_back(static_cast<int>(t.N.size()));
@@ -785,21 +689,16 @@ class SphereTrajPlanner {
   }
 
   Problem makeProblem(int M, const SurfaceState& s, const SurfaceState& g, double LrefU) {
-    const double R = prm_.R, kmaxU = prm_.kappaMax * R;
+    const double R = prm_.R, kapRefU = std::max(prm_.kappaMax * R, 1e-9);
     Problem pb;
     Boundary& b = pb.bd;
     b.M = M;
     b.ps = s.p;
     b.hs = s.h;
     b.ls = s.p.cross(s.h);
-    b.kapS = clampd(s.kappa * R, -kmaxU, kmaxU);
+    b.kapS = clampd(s.kappa * R, -kapRefU, kapRefU);
     b.pg = g.p;
-    b.hg = g.h;
-    b.lg = g.p.cross(g.h);
-    b.kapG = clampd(prm_.goalCurvature * R, -kmaxU, kmaxU);
     b.pinS = prm_.pinStartCurvature;
-    b.pinH = prm_.pinGoalHeading;
-    b.pinG = prm_.pinGoalCurvature;
     pb.tab = &table(M, prm_.quadNodes);
     for (const Obstacle& o : obs_) {
       CapOpt c;
@@ -810,42 +709,15 @@ class SphereTrajPlanner {
       pb.caps.push_back(c);
     }
     pb.LrefU = std::max(LrefU, 1e-9);
-    pb.kapLimU = prm_.curvSafety * kmaxU;
+    pb.kapRefU = kapRefU;
     pb.obsScaleU = prm_.obsScale / R;
-    pb.proxScaleU = prm_.spanLength / R;
     pb.sMinU = prm_.minSpeedFrac * pb.LrefU / M;
-    pb.agTargetU = prm_.goalLeadLength >= 0 ? prm_.goalLeadLength / R : -1;
-    // !pinGoalHeading 时 P_{M+1} 自由, 切向臂 a_g 不再驱动曲线, 臂罚项随之失效
-    pb.wLead = (prm_.pinGoalHeading && pb.agTargetU > 0) ? prm_.wGoalLead : 0;
-    // 末段对齐窗口：控制点 P_j 的 Greville 横坐标为 ξ_j = j-1（2 ≤ j ≤ M），按它到终点的
-    // 参数距离折算成物理长度后渐入。窗口比目标腿长多一个 span —— span k 要精确落在大圆上
-    // 需要 P_k..P_{k+3} 全在平面内，其中最靠前的控制点比该段起点还要再往前约一个 span。
-    // 权重用 (1-x²)² 平滑收敛到 0，避免窗口边缘的控制点在相邻周期间跳进跳出。
-    pb.legN = b.lg;
-    pb.legScaleU = prm_.spanLength / R;
-    if (prm_.goalLegLength > 0.0) {
-      const double spanPhys = pb.LrefU * R / M;   // 本次规划的平均 span 物理长度
-      // 窗口再按航程封顶：窗口吃掉整条航路时，「最短」已无自由度可言，解会被拉坏
-      // （实测 9450 km 航路上窗口超过约一半就开始侵蚀曲率裕度，0.9 倍直接校验失败）。
-      // 封顶同时让窗口随剩余航程自动收缩，末段不会出现整条剩余路径被拉上大圆的突变。
-      const double reach = std::min(prm_.goalLegLength + spanPhys, kLegReachFrac * pb.LrefU * R);
-      // pinG 时 P_M 已被终点曲率条件钉死（ℓg·P_M = 3a_g²κg），不参与，免得两项互相拉扯
-      const int jLast = b.pinG ? M - 1 : M;
-      pb.legW.assign(M + 3, 0.0);
-      for (int j = 2; j <= jLast; ++j) {
-        const double x = (M - (j - 1)) * spanPhys / reach;
-        if (x >= 1.0) continue;
-        const double t = 1.0 - x * x;
-        pb.legW[j] = t * t;
-      }
-      pb.wLeg = prm_.wGoalLeg;
-    }
     pb.wE = prm_.wEnergy;
     pb.wB = prm_.wBend;
-    pb.wK = prm_.wCurv;
+    pb.wKv = prm_.wKappaVar;
+    pb.wSp = prm_.wSpeed;
     pb.wO = prm_.wObs;
     pb.wR = prm_.wRadial;
-    pb.wP = prm_.wProx;
     return pb;
   }
 
@@ -948,10 +820,10 @@ class SphereTrajPlanner {
       return p;
     };
     const Vec3 ps2 = leadPoint(s.p, s.h);
-    // !pinGoalHeading: 终端航向不约束, 目标引导方向改用起点指向目标的自然切向 (仅初值)
+    // 终端航向不约束：目标引导方向取起点指向目标的自然切向（仅前端初值）
     Vec3 gBack = s.p - g.p;
     gBack -= g.p * gBack.dot(g.p);  // 投影到目标处切平面
-    const Vec3 gLead = (prm_.pinGoalHeading || gBack.squaredNorm() < 1e-18) ? -g.h : gBack.normalized();
+    const Vec3 gLead = gBack.squaredNorm() < 1e-18 ? -g.h : gBack.normalized();
     const Vec3 pg2 = leadPoint(g.p, gLead);
     TangentGraph tg;
     const FrontEndPath fe = tg.plan(ps2, pg2, caps);
@@ -992,27 +864,11 @@ class SphereTrajPlanner {
     return std::clamp(M, prm_.minSpans, prm_.maxSpans);
   }
 
-  void setDefaultPole(const Vec3& a, const Vec3& b) {
-    Vec3 m = a + b;
-    if (m.norm() < 1e-6) {
-      Vec3 e1, e2;
-      tangentFrame(a, e1, e2);
-      m = e1;
-    }
-    pole_ = -m.normalized();  // 作业区域中点的对跖点
-    hasPole_ = true;
-  }
-
   static SurfaceState normalizeState(const SurfaceState& s) {
     SurfaceState o = s;
     o.p = s.p.normalized();
     o.h = projectTangent(s.h, o.p).normalized();
     return o;
-  }
-  static double maxAbsDiff(const std::vector<double>& a, const std::vector<double>& b) {
-    double m = 0.0;
-    for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) m = std::max(m, std::fabs(a[i] - b[i]));
-    return m;
   }
   static double msSince(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1034,20 +890,16 @@ class SphereTrajPlanner {
   }
 
   PlannerParams prm_;
-  bool freezeAuto_ = true;
-  bool leadAuto_ = true;
   std::vector<Obstacle> obs_;
   SurfaceState goal_;
   bool hasGoal_ = false;
-  Vec3 pole_;
-  bool hasPole_ = false;
   SphereSpline curve_;
   double lastU_ = 0.0;
-  int switchHold_ = 0;
   std::map<std::pair<int, int>, SampleTable> tables_;
   std::map<std::pair<int, int>, FitCache> fitCaches_;
   std::vector<Vec3> bufP_, bufGP_;
   std::vector<int> bufNear_;
+  std::vector<double> bufKap_, bufS_, bufGK_, bufGS_;  // 曲率变化罚项的每采样点缓冲
 };
 
 }  // namespace sphtraj

@@ -122,28 +122,19 @@ static void testTrackingRefModes() {
 
   // 比例前视远场：ratio*remaining > cap 时取 cap（与固定前视一致）
   const double ratio = 0.3, cap = 0.1 * L;
-  const TrackingRef rFar = computeTrackingRef(sp, p, h, u0, cap, ratio, 0.0);
+  const TrackingRef rFar = computeTrackingRef(sp, p, h, u0, cap, ratio);
   CHECK(ratio * rFar.remaining > cap && std::fabs(rFar.lookaheadS - (rFar.s + cap)) < 1e-9,
         "比例前视远场取上限 (rem=%.3f, cap=%.3f, sLd=%.3f)", rFar.remaining, cap, rFar.lookaheadS);
 
   // 比例前视近场：Ld = ratio*remaining < cap，前视点在曲线上且平滑收缩
   const double u1 = 5.5;
   const Vec3 p1 = sp.pos(u1), h1 = sp.geom(u1).tangent;
-  const TrackingRef rNear = computeTrackingRef(sp, p1, h1, u1, cap, ratio, 0.0);
+  const TrackingRef rNear = computeTrackingRef(sp, p1, h1, u1, cap, ratio);
   const double Ld1 = std::min(ratio * rNear.remaining, cap);
   CHECK(Ld1 < cap && std::fabs(rNear.lookaheadS - (rNear.s + Ld1)) < 1e-9 && rNear.lookaheadS <= L,
         "比例前视近场按剩余弧长收缩 (rem=%.3f, Ld=%.3f)", rNear.remaining, Ld1);
   CHECK(angleBetween(rNear.lookaheadPos, sp.pos(sp.uOfS(rNear.lookaheadS))) < 1e-12,
         "比例前视点落在曲线上");
-
-  // 终端吸附：remaining <= terminalDist 时跟踪点 = 终点本身
-  const TrackingRef rTerm = computeTrackingRef(sp, p1, h1, u1, cap, ratio, rNear.remaining + 1e-6);
-  CHECK(rTerm.lookaheadS == L && angleBetween(rTerm.lookaheadPos, gEnd.pos) < 1e-14,
-        "终端吸附取终点 (sLd=%.3f vs L=%.3f)", rTerm.lookaheadS, L);
-  // terminalDist = 0 关闭吸附（固定前视超出终点时仍走切向外延分支）
-  const TrackingRef rNo = computeTrackingRef(sp, p1, h1, u1, cap, 0.0, 0.0);
-  CHECK(rNo.lookaheadS != L && angleBetween(rNo.lookaheadPos, gEnd.pos) > 1e-9,
-        "terminalDist=0 时不吸附 (sLd=%.3f vs L=%.3f)", rNo.lookaheadS, L);
 }
 
 static void testPlannerBoundaryAndGradient() {
@@ -154,8 +145,7 @@ static void testPlannerBoundaryAndGradient() {
   prm.optMargin = 10.0;
   prm.checkMargin = 4.0;
   prm.pinStartCurvature = true;
-  prm.pinGoalCurvature = true;
-  prm.goalCurvature = -0.004;
+  prm.wKappaVar = 1e3;
   SphereTrajPlanner pl(prm);
   std::vector<Obstacle> obs = {{fromLatLon(10, 12), deg2rad(5) * prm.R}, {fromLatLon(22, 26), deg2rad(4) * prm.R}};
   pl.setObstacles(obs);
@@ -170,175 +160,14 @@ static void testPlannerBoundaryAndGradient() {
   CHECK(st.valid, "从零规划有效 (len %.1f, iters %d, %.2f ms)", st.length, st.iters, st.solveMs);
   const SphereSpline& sp = pl.curve();
   const auto g0 = sp.geom(0.0), g1 = sp.geom(sp.uMax());
-  const double hs = angleBetween(g0.tangent, s0.h), hg = angleBetween(g1.tangent, headingFromAzimuth(pg, 90));
-  CHECK(hs < 1e-10 && hg < 1e-10, "起终点航向精确 (%.1e, %.1e rad)", hs, hg);
-  const double k0 = g0.kappaU / prm.R, k1 = g1.kappaU / prm.R;
-  CHECK(std::fabs(k0 - 0.012) < 1e-10 && std::fabs(k1 + 0.004) < 1e-10, "起终点曲率精确 (%.6f, %.6f)", k0, k1);
+  const double hs = angleBetween(g0.tangent, s0.h);
+  CHECK(hs < 1e-10, "起点航向精确 (%.1e rad)", hs);
+  const double k0 = g0.kappaU / prm.R;
+  CHECK(std::fabs(k0 - 0.012) < 1e-10, "起点曲率精确 (%.6f)", k0);
   CHECK(angleBetween(g0.pos, ps) < 1e-14 && angleBetween(g1.pos, pg) < 1e-14, "起终点位置精确");
-}
-
-// 末段对齐项（goalLegLength）：地球尺度再入场景下的腿长增长、安全让步与梯度正确性。
-// 「对齐腿长」= 从终点往回、|ℓg·γ| 保持在 tol 以内的连续物理弧长（ℓg = pg × hg 为终端大圆法向）。
-static double alignedLeg(const SphereSpline& c, const Vec3& lg, double R, double tol) {
-  const double L = c.length();
-  double s = L;
-  for (; s > 0.0; s -= 2000.0)
-    if (R * std::fabs(c.pos(c.uOfS(s)).dot(lg)) > tol) break;
-  return L - s;
-}
-
-static void testGoalLegAlignment() {
-  const double R = 6371000.0;
-  const Vec3 ps = fromLatLon(15, 8), pg = fromLatLon(27, 100);
-  const Vec3 hg = headingFromAzimuth(pg, 70.0);
-  const Vec3 lg = pg.cross(hg).normalized();
-  const SurfaceState s0{ps, headingFromAzimuth(ps, 60.0), 0.0};
-  auto cap = [&](double lat, double lon, double rd) { return Obstacle{fromLatLon(lat, lon), deg2rad(rd) * R}; };
-  const std::vector<Obstacle> obs = {cap(27, 37, 3.1), cap(30, 58, 3.5), cap(21, 76, 3.2), cap(18, 52, 3.0)};
-
-  auto make = [&](double legLen) {
-    PlannerParams p;
-    p.R = R;
-    p.kappaMax = 1.0 / 1.0e6;
-    p.spanLength = 600e3;
-    p.optMargin = 80e3;
-    p.checkMargin = 25e3;
-    p.pinStartCurvature = true;
-    p.pinGoalCurvature = true;
-    p.goalCurvature = 0.0;
-    p.goalLegLength = legLen;
-    return p;
-  };
-  struct Run { bool valid; double len, leg, clr, kapRatio; };
-  auto run = [&](double legLen) {
-    const PlannerParams p = make(legLen);
-    SphereTrajPlanner pl(p);
-    pl.setObstacles(obs);
-    pl.setGoal({pg, hg, 0.0});
-    const PlanStats st = pl.planFromScratch(s0);
-    Run r{st.valid, st.length, 0.0, st.minClearance, st.maxKappa / p.kappaMax};
-    if (st.valid) r.leg = alignedLeg(pl.curve(), lg, R, 5e3);
-    return r;
-  };
-
-  // 关闭时必须与历史行为一致（goalLegLength <= 0 不加项）
-  const Run off = run(-1.0);
-  CHECK(off.valid, "末段对齐：关闭时规划有效 (len %.0f km, leg %.0f km)", off.len / 1e3, off.leg / 1e3);
-
-  const Run on = run(2400e3);
-  CHECK(on.valid, "末段对齐：开启时规划仍有效 (len %.0f km)", on.len / 1e3);
-  CHECK(on.leg > 2.0 * off.leg, "末段对齐：腿长显著增长 %.0f km -> %.0f km", off.leg / 1e3, on.leg / 1e3);
-  CHECK(on.len < 1.06 * off.len, "末段对齐：总航程增幅有界 %.0f km -> %.0f km (+%.1f%%)", off.len / 1e3,
-        on.len / 1e3, 100.0 * (on.len / off.len - 1.0));
-  CHECK(on.clr > 0.0, "末段对齐：禁飞区间隔仍为正 (%.1f km)", on.clr / 1e3);
-  CHECK(on.kapRatio <= 1.0, "末段对齐：曲率未超限 (%.2f x kappaMax)", on.kapRatio);
-
-  // 腿长单调性（到饱和为止）：要得越多，拿到的不应更少
-  const Run mid = run(1200e3);
-  CHECK(mid.valid && mid.leg > off.leg && on.leg > mid.leg, "末段对齐：腿长随目标单调 %.0f < %.0f < %.0f km",
-        off.leg / 1e3, mid.leg / 1e3, on.leg / 1e3);
-
-  // 过分的要求必须软化降级，而不是把解做坏（对比 goalLeadLength 在 1200km 处直接失效）
-  const Run huge = run(8000e3);
-  CHECK(huge.valid, "末段对齐：过大目标仍得到可行解（软罚项降级）");
-  CHECK(huge.clr > 0.0 && huge.kapRatio <= 1.05, "末段对齐：过大目标下安全量不破 (clr %.1f km, kap %.2f)",
-        huge.clr / 1e3, huge.kapRatio);
-
-  // 新代价项的解析梯度
-  PlannerParams gp = make(2400e3);
-  gp.goalCurvature = -1.0e-7;  // 让 pinG 的终点曲率分支也带上非零项
-  SphereTrajPlanner plg(gp);
-  plg.setObstacles(obs);
-  plg.setGoal({pg, hg, 0.0});
-  const double gerr = plg.gradientCheck(s0, 11);
-  CHECK(gerr >= 0 && gerr < 1e-5, "末段对齐：解析梯度 vs 中心差分 (rel %.1e)", gerr);
-
-  // pinGoalCurvature=false 时 P_M 也应参与拉平
-  PlannerParams np = make(2400e3);
-  np.pinGoalCurvature = false;
-  SphereTrajPlanner pln(np);
-  pln.setObstacles(obs);
-  pln.setGoal({pg, hg, 0.0});
-  const PlanStats ns = pln.planFromScratch(s0);
-  CHECK(ns.valid && alignedLeg(pln.curve(), lg, R, 5e3) > off.leg, "末段对齐：pinGoalCurvature=false 亦生效");
-}
-
-// 终端航向放开 (pinGoalHeading=false): 终点切向不再钉死到 hg, 由优化自行决定。
-static void testFreeGoalHeading() {
-  const double R = 6371000.0;
-  const Vec3 ps = fromLatLon(15, 8), pg = fromLatLon(27, 100);
-  const Vec3 hg = headingFromAzimuth(pg, 70.0);
-  const SurfaceState s0{ps, headingFromAzimuth(ps, 60.0), 0.0};
-  auto cap = [&](double lat, double lon, double rd) { return Obstacle{fromLatLon(lat, lon), deg2rad(rd) * R}; };
-  const std::vector<Obstacle> obs = {cap(27, 37, 3.1), cap(30, 58, 3.5), cap(21, 76, 3.2)};
-
-  auto make = [&]() {
-    PlannerParams p;
-    p.R = R;
-    p.kappaMax = 1.0 / 1.0e6;
-    p.spanLength = 600e3;
-    p.optMargin = 80e3;
-    p.checkMargin = 25e3;
-    p.pinStartCurvature = true;
-    p.pinGoalCurvature = false;  // 角度放开时调用方同步关掉曲率钉死
-    return p;
-  };
-
-  // 钉死 (默认): 终端切向精确对准 hg —— 历史行为不变
-  PlannerParams pc = make();
-  SphereTrajPlanner plc(pc);
-  plc.setObstacles(obs);
-  plc.setGoal({pg, hg, 0.0});
-  const PlanStats sc = plc.planFromScratch(s0);
-  CHECK(sc.valid, "终端航向：钉死时规划有效");
-  const auto gc = plc.curve().geom(plc.curve().uMax());
-  CHECK(angleBetween(gc.tangent, hg) < 1e-10, "终端航向：钉死时切向精确 (%.1e rad)", angleBetween(gc.tangent, hg));
-
-  // 放开: 规划有效、终点位置仍精确, 但终端切向明显偏离 hg
-  PlannerParams pf = make();
-  pf.pinGoalHeading = false;
-  SphereTrajPlanner plf(pf);
-  plf.setObstacles(obs);
-  plf.setGoal({pg, hg, 0.0});  // hg 传入但应被忽略
-  const PlanStats sf = plf.planFromScratch(s0);
-  CHECK(sf.valid, "终端航向：放开时规划有效 (len %.0f km)", sf.length / 1e3);
-  const auto gf = plf.curve().geom(plf.curve().uMax());
-  CHECK(angleBetween(gf.pos, pg) < 1e-14, "终端航向：放开时终点位置仍精确");
-  CHECK(angleBetween(gf.tangent, hg) > 0.05, "终端航向：放开时切向不再对准 hg (%.2f rad)",
-        angleBetween(gf.tangent, hg));
-  CHECK(sf.minClearance > 0.0 && sf.maxKappa <= 1.05 * pf.kappaMax,
-        "终端航向：放开后安全量不破 (clr %.1f km, kap %.2f x)", sf.minClearance / 1e3, sf.maxKappa / pf.kappaMax);
-
-  // 放开后的解析梯度 (P_{M+1} 自由分支)
-  SphereTrajPlanner plg(pf);
-  plg.setObstacles(obs);
-  plg.setGoal({pg, hg, 0.0});
-  const double gerr = plg.gradientCheck(s0, 13);
-  CHECK(gerr >= 0 && gerr < 1e-5, "终端航向：放开后解析梯度 vs 中心差分 (rel %.1e)", gerr);
-}
-
-static std::vector<Vec3> densify(const std::vector<Vec3>& pts, int n) {
-  std::vector<Vec3> out;
-  for (size_t i = 1; i < pts.size(); ++i)
-    for (int k = 0; k < n; ++k) out.push_back(slerp(pts[i - 1], pts[i], double(k) / n));
-  out.push_back(pts.back());
-  return out;
-}
-
-static void testHomotopySignature() {
-  PlannerParams prm;
-  prm.R = 1.0;
-  prm.kappaMax = 10.0;
-  prm.spanLength = 0.05;
-  SphereTrajPlanner pl(prm);
-  pl.setObstacles({{fromLatLon(0, 10), deg2rad(2)}, {fromLatLon(0, 30), deg2rad(2)}});
-  pl.setHomotopyPole(fromLatLon(-10, -160));
-  const Vec3 A = fromLatLon(0, 0), B = fromLatLon(0, 20);
-  const auto north = pl.signatureOfPoints(densify({A, fromLatLon(5, 10), B}, 50));
-  const auto north2 = pl.signatureOfPoints(densify({A, fromLatLon(8, 7), fromLatLon(3, 14), B}, 50));
-  const auto south = pl.signatureOfPoints(densify({A, fromLatLon(-5, 10), B}, 50));
-  const double dSame = std::fabs(north[0] - north2[0]), dDiff = std::fabs(north[0] - south[0]);
-  CHECK(dSame < 0.5 && std::fabs(dDiff - 2 * kPi) < 1e-6, "同伦签名：同侧差 %.3f，异侧差 %.6f (应为 2π)", dSame, dDiff);
+  // 终端航向不约束：终点切向不应被钉死到 setGoal 传入的航向
+  CHECK(angleBetween(g1.tangent, headingFromAzimuth(pg, 90)) > 0.05,
+        "终点切向不钉死到 setGoal 航向 (%.2f rad)", angleBetween(g1.tangent, headingFromAzimuth(pg, 90)));
 }
 
 static void testBlockedReplan() {
@@ -360,9 +189,9 @@ static void testBlockedReplan() {
   pl.addObstacle({c.pos(c.uOfS(0.55 * c.length())), 120.0});
   st = pl.replan(s0, 0.0);
   const auto v = pl.validate(pl.curve(), 0.0);
-  CHECK(v.ok && (st.status == PlanStatus::ClassChangedForced || st.status == PlanStatus::FrontEndReplan ||
-                 st.status == PlanStatus::Ok),
-        "阻塞后重规划：status=%s, 新路径有效 (clr %.1f m)", toString(st.status), v.minClearance);
+  CHECK(v.ok && (st.status == PlanStatus::Ok || st.status == PlanStatus::FrontEndReplan),
+        "阻塞后重规划 (无同伦守卫, 可行即接受)：status=%s, 新路径有效 (clr %.1f m)",
+        toString(st.status), v.minClearance);
 }
 
 static void testRetainedStatsAndEmptyCurve() {
@@ -372,30 +201,9 @@ static void testRetainedStatsAndEmptyCurve() {
   prm.spanLength = 50.0;
   prm.optMargin = 10.0;
   prm.checkMargin = 4.0;
-  prm.freezeDistance = 30.0;
-  prm.leadLength = 80.0;
-  SphereTrajPlanner plExplicit(prm);
-  plExplicit.setKappaMax(1.0 / 20.0);
-  CHECK(std::fabs(plExplicit.params().freezeDistance - 30.0) < 1e-9, "显式冻结距离不被 setKappaMax 覆盖");
-  CHECK(std::fabs(plExplicit.params().leadLength - 80.0) < 1e-9, "显式引导段不被 setKappaMax 覆盖");
-  CHECK(std::fabs(plExplicit.params().kappaMax - 1.0 / 20.0) < 1e-12, "setKappaMax 更新曲率上限");
-
-  PlannerParams autoPrm = prm;
-  autoPrm.freezeDistance = -1.0;
-  autoPrm.leadLength = -1.0;
-  autoPrm.kappaMax = 1.0 / 40.0;
-  SphereTrajPlanner plAuto(autoPrm);
-  CHECK(std::fabs(plAuto.params().freezeDistance - 40.0) < 1e-9, "自动冻结距离初值");
-  plAuto.setKappaMax(1.0 / 20.0);
-  CHECK(std::fabs(plAuto.params().freezeDistance - 20.0) < 1e-9, "自动冻结距离随 kappaMax 更新");
-  CHECK(std::fabs(plAuto.params().leadLength - 20.0) < 1e-9, "自动引导段随 kappaMax 更新");
-
   const Vec3 ps = fromLatLon(0, 0), pg = fromLatLon(25, 30);
   const SurfaceState s0{ps, headingFromAzimuth(ps, 45), 0.0};
-  PlannerParams keepPrm = prm;
-  keepPrm.freezeDistance = -1.0;
-  keepPrm.leadLength = -1.0;
-  SphereTrajPlanner pl(keepPrm);
+  SphereTrajPlanner pl(prm);
   pl.setGoal({pg, headingFromAzimuth(pg, 60), 0.0});
   PlanStats st = pl.planFromScratch(s0);
   CHECK(st.valid && pl.hasPlan(), "保留测试：初始规划有效");
@@ -413,20 +221,7 @@ static void testRetainedStatsAndEmptyCurve() {
   CHECK(st.minClearance >= 0.0, "保留曲线间隔 %.3f m", st.minClearance);
   CHECK(angleBetween(pl.curve().pos(pl.curve().uMax()), end0) < 1e-9, "曲线终点未被坏目标替换");
 
-  PlannerParams fr = keepPrm;
-  fr.freezeDistance = 1.0e6;
-  SphereTrajPlanner plFr(fr);
-  plFr.setGoal({pg, headingFromAzimuth(pg, 60), 0.0});
-  st = plFr.planFromScratch(s0);
-  CHECK(st.valid, "冻结测试：初始规划有效");
-  const double lenF = plFr.curve().length();
-  plFr.addObstacle({plFr.curve().pos(plFr.curve().uOfS(0.5 * lenF)), 100.0});
-  st = plFr.replan(s0, 0.0);
-  CHECK(st.status == PlanStatus::Frozen, "剩余距离小于冻结距离时冻结 status=%s", toString(st.status));
-  CHECK(!st.valid && st.minClearance < 0.0, "冻结曲线已穿障时不得报有效 (clr %.3f)", st.minClearance);
-  CHECK(plFr.hasPlan() && std::fabs(st.length - lenF) < 1e-6, "冻结后统计长度仍是当前曲线");
-
-  PlannerParams badP = keepPrm;
+  PlannerParams badP = prm;
   badP.checkMargin = 1.0e9;
   SphereTrajPlanner plBad(badP);
   plBad.setObstacles({{fromLatLon(10, 10), 50.0}});
@@ -443,17 +238,82 @@ static void testRetainedStatsAndEmptyCurve() {
   CHECK(!badVal.ok, "空曲线校验为无效");
 }
 
+// 曲率变化率软罚：解析梯度、有效性、无硬上限、平滑效果。
+// 曲率总变化 TV = Σ|Δκ| 沿等参采样序列累计。
+static double kappaTotalVariation(const SphereSpline& c, int n, double R) {
+  double tv = 0, kapPrev = 0;
+  for (int i = 0; i <= n; ++i) {
+    const double u = c.uMax() * i / n;
+    const double kap = c.geom(u).kappaU / R;
+    if (i > 0) tv += std::fabs(kap - kapPrev);
+    kapPrev = kap;
+  }
+  return tv;
+}
+
+static void testCurvatureVariation() {
+  const double R = 6371000.0;
+  const Vec3 ps = fromLatLon(15, 8), pg = fromLatLon(27, 100);
+  const SurfaceState s0{ps, headingFromAzimuth(ps, 60.0), 0.0};
+  auto cap = [&](double lat, double lon, double rd) { return Obstacle{fromLatLon(lat, lon), deg2rad(rd) * R}; };
+  const std::vector<Obstacle> obs = {cap(27, 37, 3.1), cap(30, 58, 3.5), cap(21, 76, 3.2)};
+
+  auto make = [&](double wKv) {
+    PlannerParams p;
+    p.R = R;
+    p.kappaMax = 1.0 / 1.0e6;
+    p.spanLength = 600e3;
+    p.optMargin = 80e3;
+    p.checkMargin = 25e3;
+    p.wKappaVar = wKv;
+    return p;
+  };
+
+  // 梯度（含变化罚项）
+  PlannerParams gp = make(1e3);
+  SphereTrajPlanner plg(gp);
+  plg.setObstacles(obs);
+  plg.setGoal({pg, headingFromAzimuth(pg, 70.0), 0.0});
+  const double gerr = plg.gradientCheck(s0, 11);
+  CHECK(gerr >= 0 && gerr < 1e-5, "曲率变化罚：解析梯度 vs 中心差分 (rel %.1e)", gerr);
+
+  auto run = [&](double wKv) {
+    SphereTrajPlanner pl(make(wKv));
+    pl.setObstacles(obs);
+    pl.setGoal({pg, headingFromAzimuth(pg, 70.0), 0.0});
+    const PlanStats st = pl.planFromScratch(s0);
+    const double tv = st.valid ? kappaTotalVariation(pl.curve(), 200, R) : -1.0;
+    return std::make_pair(st, tv);  // (stats, 曲率总变化)
+  };
+  auto [s0r, tv0] = run(0.0);
+  auto [sKr, tvK] = run(1e3);
+  CHECK(s0r.valid && sKr.valid, "曲率变化罚：开/关均有效 (len %.0f / %.0f km)", s0r.length / 1e3, sKr.length / 1e3);
+  CHECK(sKr.minClearance > 0.0 && s0r.minClearance > 0.0, "曲率变化罚：障碍间隔为正 (%.1f / %.1f km)",
+        sKr.minClearance / 1e3, s0r.minClearance / 1e3);
+  CHECK(tvK < tv0, "曲率变化罚：开启后曲率总变化下降 (TV %.3e -> %.3e, len +%.1f%%)",
+        tv0, tvK, 100.0 * (sKr.length / s0r.length - 1.0));
+
+  // 无硬上限：把 kappaMax 收紧到远小于绕障所需曲率, 校验仍通过且 maxKappa 超过参考值
+  PlannerParams tp = make(1e3);
+  tp.kappaMax = 1.0 / 8.0e6;
+  tp.leadLength = 600e3;  // 避免 leadLength 自动值 = 1/kappaMax 过大
+  SphereTrajPlanner plt(tp);
+  plt.setObstacles(obs);
+  plt.setGoal({pg, headingFromAzimuth(pg, 70.0), 0.0});
+  const PlanStats stT = plt.planFromScratch(s0);
+  CHECK(stT.valid && stT.maxKappa > tp.kappaMax,
+        "无曲率硬上限：收紧参考曲率后仍有效 (maxKappa/kappaMax = %.2f)", stT.maxKappa / tp.kappaMax);
+}
+
 int main() {
   testQuadAndBasis();
   testGeometry();
   testPurePursuit();
   testTrackingRefModes();
   testPlannerBoundaryAndGradient();
-  testGoalLegAlignment();
-  testFreeGoalHeading();
-  testHomotopySignature();
   testBlockedReplan();
   testRetainedStatsAndEmptyCurve();
+  testCurvatureVariation();
   std::printf("\n%s (%d failures)\n", g_fail ? "SOME TESTS FAILED" : "ALL TESTS PASSED", g_fail);
   return g_fail ? 1 : 0;
 }

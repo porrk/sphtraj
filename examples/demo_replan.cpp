@@ -50,16 +50,12 @@ int main(int argc, char** argv) {
   auto rMinAt = [&](double t) { return rMinEntry + (rMinTerm - rMinEntry) * std::min(t / tDecay, 1.0); };
   PlannerParams prm;
   prm.R = 6371000.0;             // 地球平均半径
-  prm.kappaMax = 1.0 / rMinEntry; // 初始转弯半径 1200 km，之后每周期按线性减小模型更新（setKappaMax）
+  prm.kappaMax = 1.0 / rMinEntry; // 参考曲率尺度（非约束）：罚项归一化 + leadLength 自动值
   prm.spanLength = 300000.0;     // 每个 span 约 300 km（约为末段转弯半径 650 km 的一半，span 角约 2.7°）
   prm.optMargin = 60000.0;       // 优化膨胀 60 km
   prm.checkMargin = 25000.0;     // 校验膨胀 25 km（给跟踪误差留余量）
   prm.pinStartCurvature = true;   // 起点曲率 = 飞行器当前曲率（转向指令跨周期连续）
-  prm.pinGoalCurvature = true;    // 以零曲率（直线）进入末段交接
-  prm.goalLegLength = 2400e3;     // 末段沿到达航向大圆对齐（软罚项，窗口按剩余航程封顶）
-  prm.wGoalLead = 40.0;
-  prm.goalCurvature = 0.0;
-  prm.homotopyGuard = false;      // 关闭重规划的同伦保持
+  prm.wKappaVar = 1e3;            // 曲率变化率软罚
   SphereTrajPlanner planner(prm);
 
   const double R = prm.R;
@@ -78,7 +74,7 @@ int main(int argc, char** argv) {
 
   // ---------------- 从零规划 ----------------
   PlanStats st = planner.planFromScratch(start);
-  std::printf("[scratch] valid=%d  len=%.1f km  spans=%d  iters=%d  evals=%d  minClr=%.1f km  maxK=%.3e (lim %.3e)  %.2f ms\n",
+  std::printf("[scratch] valid=%d  len=%.1f km  spans=%d  iters=%d  evals=%d  minClr=%.1f km  maxK=%.3e (ref %.3e)  %.2f ms\n",
               st.valid, st.length / 1000.0, st.spans, st.iters, st.evals, st.minClearance / 1000.0, st.maxKappa,
               prm.kappaMax, st.solveMs);
   if (!st.valid) return 1;
@@ -96,7 +92,7 @@ int main(int argc, char** argv) {
 
   // ---------------- 闭环仿真 ----------------
   // 5 s 制导/重规划周期，前视 125 km，侧向漂移 30 m/s（急流量级），航向噪声 1°/步。
-  // 0.2 s 计算/通信延迟用 advanceDist = v*0.2 补偿。转弯半径减小，每周期经 setKappaMax 放宽曲率上限。
+  // 0.2 s 计算/通信延迟用 advanceDist = v*0.2 补偿。
   const double dt = 5.0, lookahead = 125000.0, drift = 30.0;
   std::mt19937 rng(42);
   std::normal_distribution<double> headNoise(0.0, deg2rad(1.0));
@@ -109,16 +105,14 @@ int main(int argc, char** argv) {
   double maxCross = 0, maxDK = 0, minClrDriven = 1e9, devAtEvent = 0, driven = 0, kapUtil = 0;
   std::vector<double> devs;  // 常规周期的相邻规划偏差
   int eventCycle = -1;
-  int classSwitches = 0;
   FILE* ft = std::fopen((outDir + "/vehicle_track.csv").c_str(), "w");
   std::fprintf(ft, "t,lat,lon,s,cross_track,v,kappa_cmd,kappa_lim,r_min_m,solve_ms,status\n");
 
   int cycle = 0;
   for (double t = 0.0; t < 2500.0; t += dt, ++cycle) {
     const double v = speedAt(t);
-    // 转弯半径线性减小：更新 planner/跟踪的曲率限幅（限幅单调放宽，旧轨迹始终可行）
+    // 转弯半径线性减小：跟踪指令按飞行器当前能力限幅（planner 侧无曲率上限）
     const double rMin = rMinAt(t), kapNow = 1.0 / rMin;
-    planner.setKappaMax(kapNow);
     const SurfaceState meas{p, h, kCmd};
 
     // 中途出现新禁飞区：放在当前路径前方 1500 km 处
@@ -147,13 +141,10 @@ int main(int argc, char** argv) {
     st = planner.replan(meas, v * 0.2);
     statusCount[toString(st.status)]++;
     times.push_back(st.solveMs);
-    if (st.status != PlanStatus::Frozen) { iterSum += st.iters; ++iterCnt; }
-    // 突现禁飞区当周期无论状态如何（Ok/ClassChangedForced/FrontEndReplan）都写出新规划
-    if (cycle == eventCycle || st.status == PlanStatus::ClassChangedForced || st.status == PlanStatus::FrontEndReplan)
+    iterSum += st.iters; ++iterCnt;
+    // 突现禁飞区当周期无论状态如何（Ok/FrontEndReplan）都写出新规划
+    if (cycle == eventCycle || st.status == PlanStatus::FrontEndReplan)
       writeCurve(outDir + "/plan_after_dynamic.csv", planner.curve());
-
-    // 低频（0.2 Hz）检查是否值得主动切换同伦类
-    if (cycle % 5 == 0 && planner.considerClassSwitch(meas)) ++classSwitches;
 
     // 相邻周期偏差（仅统计“同类且已接受”的周期）
     if (st.status == PlanStatus::Ok) {
@@ -184,9 +175,9 @@ int main(int argc, char** argv) {
                  kCmd, kapNow, rMin, st.solveMs, toString(st.status));
 
     if (ref.remaining < 3000.0) {
-      // 此处停止时路径还剩不足 3 km。航向误差相对目标进场航向 70°，不是相对正东。
-      std::printf("[t=%.1f] goal reached: pos err %.3f km, heading err vs 70 deg approach %.2f deg (%.2f km path left), final speed %.1f m/s, r_min %.0f km, flown %.1f km\n",
-                  t, R * angleBetween(p, pg) / 1000.0, rad2deg(angleBetween(h, hGoal)), ref.remaining / 1000.0, v,
+      // 此处停止时路径还剩不足 3 km（终端航向不约束）。
+      std::printf("[t=%.1f] goal reached: pos err %.3f km (%.2f km path left), final speed %.1f m/s, r_min %.0f km, flown %.1f km\n",
+                  t, R * angleBetween(p, pg) / 1000.0, ref.remaining / 1000.0, v,
                   rMin / 1000.0, driven / 1000.0);
       break;
     }
@@ -208,7 +199,6 @@ int main(int argc, char** argv) {
               times[times.size() / 2], times[times.size() * 99 / 100], times.back());
   std::printf("mean L-BFGS iterations per replan: %.1f\n", double(iterSum) / std::max(1L, iterCnt));
   for (const auto& kv : statusCount) std::printf("  status %-28s %d\n", kv.first.c_str(), kv.second);
-  std::printf("voluntary class switches: %d\n", classSwitches);
   std::printf("turn-radius model: %.0f -> %.0f km linear (kappaLim %.3e -> %.3e 1/m), max kappa_cmd utilization = %.0f%%\n",
               rMinEntry / 1000.0, rMinTerm / 1000.0, 1.0 / rMinEntry, 1.0 / rMinTerm, 100.0 * kapUtil);
   std::printf("max |cross-track| = %.2f km, max |dKappa_cmd| per cycle = %.3e 1/m\n", maxCross / 1000.0, maxDK);
