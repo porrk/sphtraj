@@ -263,6 +263,60 @@ static void testGoalLegAlignment() {
   CHECK(ns.valid && alignedLeg(pln.curve(), lg, R, 5e3) > off.leg, "末段对齐：pinGoalCurvature=false 亦生效");
 }
 
+// 终端航向放开 (pinGoalHeading=false): 终点切向不再钉死到 hg, 由优化自行决定。
+static void testFreeGoalHeading() {
+  const double R = 6371000.0;
+  const Vec3 ps = fromLatLon(15, 8), pg = fromLatLon(27, 100);
+  const Vec3 hg = headingFromAzimuth(pg, 70.0);
+  const SurfaceState s0{ps, headingFromAzimuth(ps, 60.0), 0.0};
+  auto cap = [&](double lat, double lon, double rd) { return Obstacle{fromLatLon(lat, lon), deg2rad(rd) * R}; };
+  const std::vector<Obstacle> obs = {cap(27, 37, 3.1), cap(30, 58, 3.5), cap(21, 76, 3.2)};
+
+  auto make = [&]() {
+    PlannerParams p;
+    p.R = R;
+    p.kappaMax = 1.0 / 1.0e6;
+    p.spanLength = 600e3;
+    p.optMargin = 80e3;
+    p.checkMargin = 25e3;
+    p.pinStartCurvature = true;
+    p.pinGoalCurvature = false;  // 角度放开时调用方同步关掉曲率钉死
+    return p;
+  };
+
+  // 钉死 (默认): 终端切向精确对准 hg —— 历史行为不变
+  PlannerParams pc = make();
+  SphereTrajPlanner plc(pc);
+  plc.setObstacles(obs);
+  plc.setGoal({pg, hg, 0.0});
+  const PlanStats sc = plc.planFromScratch(s0);
+  CHECK(sc.valid, "终端航向：钉死时规划有效");
+  const auto gc = plc.curve().geom(plc.curve().uMax());
+  CHECK(angleBetween(gc.tangent, hg) < 1e-10, "终端航向：钉死时切向精确 (%.1e rad)", angleBetween(gc.tangent, hg));
+
+  // 放开: 规划有效、终点位置仍精确, 但终端切向明显偏离 hg
+  PlannerParams pf = make();
+  pf.pinGoalHeading = false;
+  SphereTrajPlanner plf(pf);
+  plf.setObstacles(obs);
+  plf.setGoal({pg, hg, 0.0});  // hg 传入但应被忽略
+  const PlanStats sf = plf.planFromScratch(s0);
+  CHECK(sf.valid, "终端航向：放开时规划有效 (len %.0f km)", sf.length / 1e3);
+  const auto gf = plf.curve().geom(plf.curve().uMax());
+  CHECK(angleBetween(gf.pos, pg) < 1e-14, "终端航向：放开时终点位置仍精确");
+  CHECK(angleBetween(gf.tangent, hg) > 0.05, "终端航向：放开时切向不再对准 hg (%.2f rad)",
+        angleBetween(gf.tangent, hg));
+  CHECK(sf.minClearance > 0.0 && sf.maxKappa <= 1.05 * pf.kappaMax,
+        "终端航向：放开后安全量不破 (clr %.1f km, kap %.2f x)", sf.minClearance / 1e3, sf.maxKappa / pf.kappaMax);
+
+  // 放开后的解析梯度 (P_{M+1} 自由分支)
+  SphereTrajPlanner plg(pf);
+  plg.setObstacles(obs);
+  plg.setGoal({pg, hg, 0.0});
+  const double gerr = plg.gradientCheck(s0, 13);
+  CHECK(gerr >= 0 && gerr < 1e-5, "终端航向：放开后解析梯度 vs 中心差分 (rel %.1e)", gerr);
+}
+
 static std::vector<Vec3> densify(const std::vector<Vec3>& pts, int n) {
   std::vector<Vec3> out;
   for (size_t i = 1; i < pts.size(); ++i)
@@ -396,6 +450,7 @@ int main() {
   testTrackingRefModes();
   testPlannerBoundaryAndGradient();
   testGoalLegAlignment();
+  testFreeGoalHeading();
   testHomotopySignature();
   testBlockedReplan();
   testRetainedStatsAndEmptyCurve();

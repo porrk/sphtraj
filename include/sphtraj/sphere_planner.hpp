@@ -54,6 +54,8 @@ struct PlannerParams {
   int quadNodes = 5;          // 每 span 的 Gauss-Legendre 节点数
   // ---- 边界条件 ----
   bool pinStartCurvature = true;
+  bool pinGoalHeading = true;  // 终端切向钉死到目标航向 hg (P_{M+1} = pg - a_g*hg)。false 时
+                               // P_{M+1} 自由, 终端航向由优化自行决定 (忽略到达角约束)。
   bool pinGoalCurvature = false;
   double goalCurvature = 0.0;  // 1/物理长度
   double goalLeadLength = -1;  // 终点切向臂 a_g 目标长度（物理）。<0 自动（能量项收敛到 ≈ spanLength/3）。
@@ -469,7 +471,8 @@ class SphereTrajPlanner {
     Vec3 ps, hs, ls, pg, hg, lg;
     double kapS = 0.0, kapG = 0.0;  // 单位球曲率
     bool pinS = true, pinG = false;
-    int numVars() const { return 2 + (pinS ? 2 : 3) + 3 * (M - 3) + (pinG ? 2 : 3); }
+    bool pinH = true;  // 终端切向钉死 (P_{M+1} = pg - a_g*hg)；false 时 P_{M+1} 为自由控制点 (3 变量)
+    int numVars() const { return 2 + (pinS ? 2 : 3) + 3 * (M - 3) + (pinG ? 2 : 3) + (pinH ? 0 : 3); }
   };
   struct CapOpt {
     Vec3 n;
@@ -525,10 +528,17 @@ class SphereTrajPlanner {
     for (int j = 3; j <= M - 1; ++j, k += 3) P[j] = Vec3(x[k], x[k + 1], x[k + 2]);
     if (b.pinG) {
       P[M] = b.pg * x[k] + b.hg * x[k + 1] + b.lg * (3.0 * ag * ag * b.kapG);
+      k += 2;
     } else {
       P[M] = Vec3(x[k], x[k + 1], x[k + 2]);
+      k += 3;
     }
-    P[M + 1] = b.pg - b.hg * ag;
+    if (b.pinH) {
+      P[M + 1] = b.pg - b.hg * ag;
+    } else {
+      P[M + 1] = Vec3(x[k], x[k + 1], x[k + 2]);
+      k += 3;
+    }
     P[M + 2] = b.pg;
   }
 
@@ -538,7 +548,7 @@ class SphereTrajPlanner {
     g.assign(x.size(), 0.0);
     const double as = std::exp(x[0]), ag = std::exp(x[1]);
     g[0] = gP[1].dot(b.hs) * as;
-    g[1] = -gP[M + 1].dot(b.hg) * ag;
+    if (b.pinH) g[1] = -gP[M + 1].dot(b.hg) * ag;  // !pinH 时 a_g 不再驱动 P_{M+1}, 梯度恒 0
     int k = 2;
     auto put3 = [&](const Vec3& v) {
       g[k] = v.x;
@@ -559,9 +569,11 @@ class SphereTrajPlanner {
       g[1] += gP[M].dot(b.lg) * 6.0 * ag * ag * b.kapG;
       g[k] = gP[M].dot(b.pg);
       g[k + 1] = gP[M].dot(b.hg);
+      k += 2;
     } else {
       put3(gP[M]);
     }
+    if (!b.pinH) put3(gP[M + 1]);
   }
 
   static std::vector<double> toVars(const Boundary& b, const std::vector<Vec3>& P, double aMin) {
@@ -587,9 +599,11 @@ class SphereTrajPlanner {
     if (b.pinG) {
       x[k] = P[M].dot(b.pg);
       x[k + 1] = P[M].dot(b.hg);
+      k += 2;
     } else {
       put3(P[M]);
     }
+    if (!b.pinH) put3(P[M + 1]);
     return x;
   }
 
@@ -784,6 +798,7 @@ class SphereTrajPlanner {
     b.lg = g.p.cross(g.h);
     b.kapG = clampd(prm_.goalCurvature * R, -kmaxU, kmaxU);
     b.pinS = prm_.pinStartCurvature;
+    b.pinH = prm_.pinGoalHeading;
     b.pinG = prm_.pinGoalCurvature;
     pb.tab = &table(M, prm_.quadNodes);
     for (const Obstacle& o : obs_) {
@@ -800,7 +815,8 @@ class SphereTrajPlanner {
     pb.proxScaleU = prm_.spanLength / R;
     pb.sMinU = prm_.minSpeedFrac * pb.LrefU / M;
     pb.agTargetU = prm_.goalLeadLength >= 0 ? prm_.goalLeadLength / R : -1;
-    pb.wLead = pb.agTargetU > 0 ? prm_.wGoalLead : 0;
+    // !pinGoalHeading 时 P_{M+1} 自由, 切向臂 a_g 不再驱动曲线, 臂罚项随之失效
+    pb.wLead = (prm_.pinGoalHeading && pb.agTargetU > 0) ? prm_.wGoalLead : 0;
     // 末段对齐窗口：控制点 P_j 的 Greville 横坐标为 ξ_j = j-1（2 ≤ j ≤ M），按它到终点的
     // 参数距离折算成物理长度后渐入。窗口比目标腿长多一个 span —— span k 要精确落在大圆上
     // 需要 P_k..P_{k+3} 全在平面内，其中最靠前的控制点比该段起点还要再往前约一个 span。
@@ -931,7 +947,12 @@ class SphereTrajPlanner {
       }
       return p;
     };
-    const Vec3 ps2 = leadPoint(s.p, s.h), pg2 = leadPoint(g.p, -g.h);
+    const Vec3 ps2 = leadPoint(s.p, s.h);
+    // !pinGoalHeading: 终端航向不约束, 目标引导方向改用起点指向目标的自然切向 (仅初值)
+    Vec3 gBack = s.p - g.p;
+    gBack -= g.p * gBack.dot(g.p);  // 投影到目标处切平面
+    const Vec3 gLead = (prm_.pinGoalHeading || gBack.squaredNorm() < 1e-18) ? -g.h : gBack.normalized();
+    const Vec3 pg2 = leadPoint(g.p, gLead);
     TangentGraph tg;
     const FrontEndPath fe = tg.plan(ps2, pg2, caps);
     if (!fe.ok) return false;
